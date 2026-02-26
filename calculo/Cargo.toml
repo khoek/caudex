@@ -1,6 +1,6 @@
 [package]
 name = "calculo"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Numeric types and operations for high-performance scientific computing."
