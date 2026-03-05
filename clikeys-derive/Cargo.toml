@@ -1,11 +1,11 @@
 [package]
 name = "clikeys-derive"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Derive macro for clikeys::CliKeys."
 readme = "README.md"
-repository = "https://github.com/khoek/ferramentum"
+repository = "https://github.com/khoek/caudex"
 
 [lib]
 proc-macro = true

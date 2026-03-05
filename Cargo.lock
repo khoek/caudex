@@ -47,7 +47,7 @@ checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
 name = "calculo"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "ahash",
  "dashu-base",
@@ -67,7 +67,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clikeys"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "itertools",
  "thiserror",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "clikeys-derive"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "syntheon"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "flate2",
  "fs2",

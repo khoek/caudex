@@ -1,11 +1,11 @@
 [package]
 name = "clikeys"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Namespace-aware KEY=VALUE overrides for nested configuration structs."
 readme = "README.md"
-repository = "https://github.com/khoek/ferramentum"
+repository = "https://github.com/khoek/caudex"
 
 [dependencies]
 thiserror = "2"
