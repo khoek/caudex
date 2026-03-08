@@ -1,0 +1,23 @@
+[package]
+name = "capulus"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Shared support helpers for komputation CLI tools."
+repository = "https://github.com/khoek/caudex"
+
+[dependencies]
+anyhow = "1"
+dialoguer = "0.12"
+dirs = "6"
+fs2 = "0.4"
+indicatif = "0.18"
+libc = "0.2"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["parsing"] }
+toml = "1"
+webbrowser = "1"
