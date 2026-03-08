@@ -168,11 +168,7 @@ fn lock_root() -> PathBuf {
 
 fn nonempty_env_var_os(key: &str) -> Option<OsString> {
     let value = env::var_os(key)?;
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn bypass_token(tool: &str) -> OsString {

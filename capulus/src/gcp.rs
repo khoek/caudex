@@ -63,9 +63,7 @@ impl CredentialSource {
 }
 
 pub fn detect_project(cached_project: Option<&str>, include_cached: bool) -> Option<String> {
-    if include_cached
-        && let Some(project) = nonempty(cached_project)
-    {
+    if include_cached && let Some(project) = nonempty(cached_project) {
         return Some(project.to_owned());
     }
     for env_key in [
@@ -97,9 +95,7 @@ pub fn detect_project(cached_project: Option<&str>, include_cached: bool) -> Opt
 
 pub fn detect_credentials_path(cached_path: Option<&str>, include_cached: bool) -> Option<String> {
     let mut candidates = Vec::new();
-    if include_cached
-        && let Some(path) = nonempty(cached_path)
-    {
+    if include_cached && let Some(path) = nonempty(cached_path) {
         candidates.push(path.to_owned());
     }
     if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
@@ -193,13 +189,20 @@ fn credential_source(configured_credentials_path: Option<&str>) -> Result<Creden
     bail!("No active gcloud account or application-default credentials were found.")
 }
 
-fn load_cached_access_token(cache_path: &Path, source: &CredentialSource) -> Result<Option<String>> {
+fn load_cached_access_token(
+    cache_path: &Path,
+    source: &CredentialSource,
+) -> Result<Option<String>> {
     let content = match fs::read_to_string(cache_path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("Failed to read cached GCP access token: {}", cache_path.display()));
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to read cached GCP access token: {}",
+                    cache_path.display()
+                )
+            });
         }
     };
     if content.trim().is_empty() {
@@ -233,7 +236,12 @@ fn save_cached_access_token(
         Some(0o600),
         Some(0o700),
     )
-    .with_context(|| format!("Failed to write cached GCP access token: {}", cache_path.display()))
+    .with_context(|| {
+        format!(
+            "Failed to write cached GCP access token: {}",
+            cache_path.display()
+        )
+    })
 }
 
 fn expires_at_epoch_ms(token_expiry: Option<&str>) -> Result<u128> {

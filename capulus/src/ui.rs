@@ -3,8 +3,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use dialoguer::theme::ColorfulTheme;
 use dialoguer::Confirm;
+use dialoguer::theme::ColorfulTheme;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 

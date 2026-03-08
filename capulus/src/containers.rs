@@ -173,7 +173,12 @@ impl ContainerRuntime {
         run_status_streaming(&mut command, "run container")
     }
 
-    pub fn login_password_stdin(self, registry: &str, username: &str, password: &str) -> Result<()> {
+    pub fn login_password_stdin(
+        self,
+        registry: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
         let mut command = self.command();
         command
             .arg("login")
@@ -181,7 +186,11 @@ impl ContainerRuntime {
             .arg(username)
             .arg("--password-stdin")
             .arg(registry);
-        run_status_with_input(&mut command, "log in container runtime", password.as_bytes())
+        run_status_with_input(
+            &mut command,
+            "log in container runtime",
+            password.as_bytes(),
+        )
     }
 
     fn is_available(self) -> bool {

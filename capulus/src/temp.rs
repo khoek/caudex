@@ -42,7 +42,8 @@ pub fn read_toml_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     if raw.trim().is_empty() {
         return Ok(None);
     }

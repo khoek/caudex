@@ -101,8 +101,9 @@ pub fn create_artifact_dir() -> Result<(String, PathBuf)> {
             Ok(()) => return Ok((artifact_id, dir)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("Failed to create artifact directory: {}", dir.display()));
+                return Err(err).with_context(|| {
+                    format!("Failed to create artifact directory: {}", dir.display())
+                });
             }
         }
     }
