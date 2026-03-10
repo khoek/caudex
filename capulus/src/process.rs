@@ -235,7 +235,7 @@ mod tests {
         command.args(["user@example.com", "echo hello world"]);
 
         assert_eq!(
-            "ssh user@example.com 'echo hello world'",
+            "ssh 'user@example.com' 'echo hello world'",
             render_command(&command)
         );
     }
