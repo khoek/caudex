@@ -1,10 +1,11 @@
 [package]
 name = "capulus"
 version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-only"
+edition.workspace = true
+license.workspace = true
 description = "Shared support helpers for komputation CLI tools."
-repository = "https://github.com/khoek/caudex"
+repository.workspace = true
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
