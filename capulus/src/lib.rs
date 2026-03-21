@@ -11,5 +11,6 @@ pub mod temp;
 pub mod ui;
 
 pub use lock::{
-    InvocationLock, LockError, acquire, configure_child_command, configure_privileged_child_command,
+    InvocationLock, LockError, acquire, acquire_named, configure_child_command,
+    configure_privileged_child_command,
 };

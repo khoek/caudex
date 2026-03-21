@@ -64,64 +64,15 @@ pub fn acquire(tool: &str, wait: bool) -> Result<InvocationLock, LockError> {
     let tool = sanitize_component(tool);
     let token = bypass_token(&tool);
     let _ = ACTIVE_BYPASS_TOKEN.set(token.clone());
-    let path = lock_path(&tool);
     if env::var_os(BYPASS_ENV_VAR).as_ref() == Some(&token) {
+        let path = lock_path(&tool);
         return Ok(InvocationLock { _file: None, path });
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| LockError::CreateDir {
-            tool: tool.clone(),
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
+    acquire_sanitized(&tool, wait)
+}
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|source| LockError::Open {
-            tool: tool.clone(),
-            path: path.display().to_string(),
-            source,
-        })?;
-
-    let mut wait_ui = LockWaitUi::new(&tool, &path);
-    loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => {
-                let result = write_lock_metadata(&tool, &path, &mut file);
-                wait_ui.clear();
-                result?;
-                break;
-            }
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
-                if !wait {
-                    return Err(LockError::AlreadyRunning {
-                        tool,
-                        path: path.display().to_string(),
-                    });
-                }
-                wait_ui.show();
-                thread::sleep(LOCK_WAIT_POLL_INTERVAL);
-            }
-            Err(source) => {
-                wait_ui.clear();
-                return Err(LockError::Open {
-                    tool,
-                    path: path.display().to_string(),
-                    source,
-                });
-            }
-        }
-    }
-
-    Ok(InvocationLock {
-        _file: Some(file),
-        path,
-    })
+pub fn acquire_named(name: &str, wait: bool) -> Result<InvocationLock, LockError> {
+    acquire_sanitized(&sanitize_component(name), wait)
 }
 
 pub fn configure_child_command(command: &mut Command) {
@@ -169,6 +120,64 @@ fn write_lock_metadata(tool: &str, path: &Path, file: &mut File) -> Result<(), L
         source,
     })?;
     Ok(())
+}
+
+fn acquire_sanitized(tool: &str, wait: bool) -> Result<InvocationLock, LockError> {
+    let path = lock_path(tool);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| LockError::CreateDir {
+            tool: tool.to_owned(),
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| LockError::Open {
+            tool: tool.to_owned(),
+            path: path.display().to_string(),
+            source,
+        })?;
+
+    let mut wait_ui = LockWaitUi::new(tool, &path);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                let result = write_lock_metadata(tool, &path, &mut file);
+                wait_ui.clear();
+                result?;
+                break;
+            }
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                if !wait {
+                    return Err(LockError::AlreadyRunning {
+                        tool: tool.to_owned(),
+                        path: path.display().to_string(),
+                    });
+                }
+                wait_ui.show();
+                thread::sleep(LOCK_WAIT_POLL_INTERVAL);
+            }
+            Err(source) => {
+                wait_ui.clear();
+                return Err(LockError::Open {
+                    tool: tool.to_owned(),
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(InvocationLock {
+        _file: Some(file),
+        path,
+    })
 }
 
 fn lock_path(tool: &str) -> PathBuf {
@@ -256,7 +265,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{LockError, acquire};
+    use super::{LockError, acquire, acquire_named};
 
     fn unique_tool_name() -> String {
         let now = SystemTime::now()
@@ -304,5 +313,16 @@ mod tests {
         let second = handle.join().expect("join waiter");
         drop(second);
         fs::remove_file(second_path).ok();
+    }
+
+    #[test]
+    fn acquire_named_uses_the_same_lock_namespace_without_bypass() {
+        let tool = unique_tool_name();
+        let first = acquire_named(&tool, false).expect("acquire first named lock");
+        let second = acquire_named(&tool, false).expect_err("second named acquisition should fail");
+        assert!(matches!(second, LockError::AlreadyRunning { .. }));
+        let first_path = first.path().to_path_buf();
+        drop(first);
+        fs::remove_file(first_path).ok();
     }
 }
