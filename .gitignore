@@ -3,3 +3,6 @@
 *.rs.bk
 .cargo/config
 .cargo/config.toml
+Cargo.lock
+**/Cargo.lock
+!**/vendor/**/Cargo.lock
