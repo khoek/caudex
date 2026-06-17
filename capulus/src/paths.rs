@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 
@@ -6,11 +6,11 @@ pub fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow!("Failed to determine home directory"))
 }
 
-pub fn app_dir(tool: &str) -> Result<PathBuf> {
-    Ok(home_dir()?.join(format!(".{}", sanitize_component(tool))))
+pub fn app_dir(root: impl AsRef<Path>, tool: &str) -> PathBuf {
+    root.as_ref().join(sanitize_component(tool))
 }
 
-fn sanitize_component(value: &str) -> String {
+pub fn sanitize_component(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {

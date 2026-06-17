@@ -12,7 +12,7 @@ use crate::store::{ensure_directory, write_toml_file};
 const CONTAINERS_DIR_NAME: &str = "containers";
 const METADATA_FILE_NAME: &str = "metadata.toml";
 const IMAGE_ARCHIVE_FILE_NAME: &str = "image.tar";
-const LABEL_PREFIX: &str = "io.khoek.arca.";
+const LABEL_DOMAIN_PREFIX: &str = "io.khoek.";
 const ARTIFACT_ID_LENGTH: usize = 8;
 const ARTIFACT_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
@@ -82,18 +82,18 @@ impl From<&ArtifactMetadata> for ArtifactSummary {
     }
 }
 
-pub fn containers_root() -> Result<PathBuf> {
-    Ok(app_dir("arca")?.join(CONTAINERS_DIR_NAME))
+pub fn containers_root(root: impl AsRef<Path>, tool: &str) -> PathBuf {
+    app_dir(root, tool).join(CONTAINERS_DIR_NAME)
 }
 
-pub fn ensure_containers_root() -> Result<PathBuf> {
-    let path = containers_root()?;
+pub fn ensure_containers_root(root: impl AsRef<Path>, tool: &str) -> Result<PathBuf> {
+    let path = containers_root(root, tool);
     ensure_directory(&path, None)?;
     Ok(path)
 }
 
-pub fn create_artifact_dir() -> Result<(String, PathBuf)> {
-    let root = ensure_containers_root()?;
+pub fn create_artifact_dir(root: impl AsRef<Path>, tool: &str) -> Result<(String, PathBuf)> {
+    let root = ensure_containers_root(root, tool)?;
     for _ in 0..128 {
         let artifact_id = random_artifact_id();
         let dir = root.join(&artifact_id);
@@ -121,8 +121,8 @@ pub fn save_metadata(dir: &Path, metadata: &ArtifactMetadata) -> Result<()> {
         .with_context(|| format!("Failed to write artifact metadata in {}", dir.display()))
 }
 
-pub fn load_stored_artifacts() -> Result<Vec<StoredArtifact>> {
-    let root = ensure_containers_root()?;
+pub fn load_stored_artifacts(root: impl AsRef<Path>, tool: &str) -> Result<Vec<StoredArtifact>> {
+    let root = ensure_containers_root(root, tool)?;
     let mut artifacts = Vec::new();
     for entry in fs::read_dir(&root)
         .with_context(|| format!("Failed to read container directory: {}", root.display()))?
@@ -162,10 +162,18 @@ pub fn load_stored_artifacts() -> Result<Vec<StoredArtifact>> {
     Ok(artifacts)
 }
 
-pub fn resolve_artifact(selector: Option<&str>) -> Result<StoredArtifact> {
-    let artifacts = load_stored_artifacts()?;
+pub fn resolve_artifact(
+    root: impl AsRef<Path>,
+    tool: &str,
+    selector: Option<&str>,
+) -> Result<StoredArtifact> {
+    let root = root.as_ref();
+    let artifacts = load_stored_artifacts(root, tool)?;
     if artifacts.is_empty() {
-        bail!("No local `arca` artifacts found in `~/.arca/containers`.");
+        bail!(
+            "No local artifacts found in `{}`.",
+            containers_root(root, tool).display()
+        );
     }
     let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(artifacts[0].clone());
@@ -212,9 +220,7 @@ pub fn resolve_artifact(selector: Option<&str>) -> Result<StoredArtifact> {
         bail!("Crate selector `{selector}` matches multiple artifacts: {ids}");
     }
 
-    Err(anyhow!(
-        "No artifact matched `{selector}`. Run `arca list`."
-    ))
+    Err(anyhow!("No artifact matched `{selector}`."))
 }
 
 pub fn sanitize_segment(value: &str) -> String {
@@ -251,48 +257,58 @@ pub fn artifact_id_from_tracking_tag(tag: &str) -> Option<&str> {
     is_valid_artifact_id(tag).then_some(tag)
 }
 
-pub fn arca_image_labels(metadata: &ArtifactMetadata) -> Vec<(String, String)> {
+pub fn image_labels(tool: &str, metadata: &ArtifactMetadata) -> Vec<(String, String)> {
     vec![
         (
-            label_key("schema-version"),
+            label_key(tool, "schema-version"),
             metadata.schema_version.to_string(),
         ),
-        (label_key("artifact-id"), metadata.artifact_id.clone()),
-        (label_key("remote-tag"), metadata.remote_tag.clone()),
+        (label_key(tool, "artifact-id"), metadata.artifact_id.clone()),
+        (label_key(tool, "remote-tag"), metadata.remote_tag.clone()),
         (
-            label_key("build-fingerprint"),
+            label_key(tool, "build-fingerprint"),
             metadata.build_fingerprint.clone(),
         ),
         (
-            label_key("created-at-epoch-ms"),
+            label_key(tool, "created-at-epoch-ms"),
             metadata.created_at_epoch_ms.to_string(),
         ),
-        (label_key("crate-name"), metadata.crate_name.clone()),
-        (label_key("binary-name"), metadata.binary_name.clone()),
-        (label_key("cargo-profile"), metadata.cargo_profile.clone()),
+        (label_key(tool, "crate-name"), metadata.crate_name.clone()),
+        (label_key(tool, "binary-name"), metadata.binary_name.clone()),
         (
-            label_key("cargo-features"),
+            label_key(tool, "cargo-profile"),
+            metadata.cargo_profile.clone(),
+        ),
+        (
+            label_key(tool, "cargo-features"),
             metadata.cargo_features.join(","),
         ),
-        (label_key("base-image"), metadata.base_image.clone()),
+        (label_key(tool, "base-image"), metadata.base_image.clone()),
     ]
 }
 
-pub fn artifact_summary_from_labels(labels: &HashMap<String, String>) -> Option<ArtifactSummary> {
-    let schema_version = label_value(labels, "schema-version")?.parse::<u32>().ok()?;
+pub fn artifact_summary_from_labels(
+    tool: &str,
+    labels: &HashMap<String, String>,
+) -> Option<ArtifactSummary> {
+    let schema_version = label_value(tool, labels, "schema-version")?
+        .parse::<u32>()
+        .ok()?;
     if schema_version != CURRENT_SCHEMA_VERSION {
         return None;
     }
     Some(ArtifactSummary {
-        artifact_id: label_value(labels, "artifact-id")?,
-        remote_tag: label_value(labels, "remote-tag")?,
-        build_fingerprint: label_value(labels, "build-fingerprint")?,
-        created_at_epoch_ms: label_value(labels, "created-at-epoch-ms")?.parse().ok()?,
-        crate_name: label_value(labels, "crate-name")?,
-        binary_name: label_value(labels, "binary-name")?,
-        cargo_profile: label_value(labels, "cargo-profile")?,
-        cargo_features: parse_label_features(label_value(labels, "cargo-features")?.as_str()),
-        base_image: label_value(labels, "base-image")?,
+        artifact_id: label_value(tool, labels, "artifact-id")?,
+        remote_tag: label_value(tool, labels, "remote-tag")?,
+        build_fingerprint: label_value(tool, labels, "build-fingerprint")?,
+        created_at_epoch_ms: label_value(tool, labels, "created-at-epoch-ms")?
+            .parse()
+            .ok()?,
+        crate_name: label_value(tool, labels, "crate-name")?,
+        binary_name: label_value(tool, labels, "binary-name")?,
+        cargo_profile: label_value(tool, labels, "cargo-profile")?,
+        cargo_features: parse_label_features(label_value(tool, labels, "cargo-features")?.as_str()),
+        base_image: label_value(tool, labels, "base-image")?,
     })
 }
 
@@ -310,12 +326,21 @@ fn is_valid_artifact_id(value: &str) -> bool {
             .all(|byte| ARTIFACT_ID_ALPHABET.contains(&byte))
 }
 
-fn label_key(suffix: &str) -> String {
-    format!("{LABEL_PREFIX}{suffix}")
+fn label_key(tool: &str, suffix: &str) -> String {
+    format!("{}{suffix}", label_prefix(tool))
 }
 
-fn label_value(labels: &HashMap<String, String>, suffix: &str) -> Option<String> {
-    labels.get(&label_key(suffix)).cloned()
+fn label_prefix(tool: &str) -> String {
+    let component = sanitize_segment(tool);
+    if component.is_empty() {
+        format!("{LABEL_DOMAIN_PREFIX}tool.")
+    } else {
+        format!("{LABEL_DOMAIN_PREFIX}{component}.")
+    }
+}
+
+fn label_value(tool: &str, labels: &HashMap<String, String>, suffix: &str) -> Option<String> {
+    labels.get(&label_key(tool, suffix)).cloned()
 }
 
 fn parse_label_features(value: &str) -> Vec<String> {
@@ -325,4 +350,74 @@ fn parse_label_features(value: &str) -> Vec<String> {
         .filter(|feature| !feature.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use super::{ArtifactMetadata, artifact_summary_from_labels, containers_root, image_labels};
+
+    fn metadata() -> ArtifactMetadata {
+        ArtifactMetadata {
+            schema_version: super::CURRENT_SCHEMA_VERSION,
+            artifact_id: "abc123xy".to_owned(),
+            remote_tag: "demo-abc123xy".to_owned(),
+            build_fingerprint: "fingerprint".to_owned(),
+            kind: "container".to_owned(),
+            created_at_epoch_ms: 1234,
+            crate_name: "demo".to_owned(),
+            crate_version: "1.2.3".to_owned(),
+            binary_name: "demo".to_owned(),
+            source_path: "/src".to_owned(),
+            manifest_path: "/src/Cargo.toml".to_owned(),
+            cargo_profile: "release".to_owned(),
+            cargo_features: vec!["gpu".to_owned(), "cloud".to_owned()],
+            base_image: "debian:bookworm".to_owned(),
+            runtime: "docker".to_owned(),
+            local_tag: "local".to_owned(),
+            archive_file: "image.tar".to_owned(),
+            uploaded_ref: None,
+            uploaded_at_epoch_ms: None,
+        }
+    }
+
+    #[test]
+    fn containers_root_uses_sanitized_tool_namespace() {
+        assert_eq!(
+            PathBuf::from("state").join("fancy-tool").join("containers"),
+            containers_root("state", "Fancy Tool!")
+        );
+    }
+
+    #[test]
+    fn image_labels_are_scoped_to_the_tool_name() {
+        let labels: HashMap<_, _> = image_labels("Fancy Tool!", &metadata())
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            Some(&super::CURRENT_SCHEMA_VERSION.to_string()),
+            labels.get("io.khoek.fancy-tool.schema-version")
+        );
+        assert!(labels.contains_key("io.khoek.fancy-tool.artifact-id"));
+        assert!(!labels.contains_key("io.khoek.tool.artifact-id"));
+    }
+
+    #[test]
+    fn artifact_summary_reads_only_matching_tool_labels() {
+        let labels: HashMap<_, _> = image_labels("Fancy Tool!", &metadata())
+            .into_iter()
+            .collect();
+
+        let summary = artifact_summary_from_labels("Fancy Tool!", &labels)
+            .expect("matching tool labels should produce a summary");
+        assert_eq!("abc123xy", summary.artifact_id);
+        assert_eq!(
+            vec!["gpu".to_owned(), "cloud".to_owned()],
+            summary.cargo_features
+        );
+        assert!(artifact_summary_from_labels("Other Tool", &labels).is_none());
+    }
 }

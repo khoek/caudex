@@ -60,19 +60,27 @@ pub enum LockError {
     },
 }
 
-pub fn acquire(tool: &str, wait: bool) -> Result<InvocationLock, LockError> {
+pub fn acquire_in(
+    root: impl AsRef<Path>,
+    tool: &str,
+    wait: bool,
+) -> Result<InvocationLock, LockError> {
     let tool = sanitize_component(tool);
     let token = bypass_token(&tool);
     let _ = ACTIVE_BYPASS_TOKEN.set(token.clone());
     if env::var_os(BYPASS_ENV_VAR).as_ref() == Some(&token) {
-        let path = lock_path(&tool);
+        let path = lock_path(root.as_ref(), &tool);
         return Ok(InvocationLock { _file: None, path });
     }
-    acquire_sanitized(&tool, wait)
+    acquire_sanitized(root.as_ref(), &tool, wait)
 }
 
-pub fn acquire_named(name: &str, wait: bool) -> Result<InvocationLock, LockError> {
-    acquire_sanitized(&sanitize_component(name), wait)
+pub fn acquire_named_in(
+    root: impl AsRef<Path>,
+    name: &str,
+    wait: bool,
+) -> Result<InvocationLock, LockError> {
+    acquire_sanitized(root.as_ref(), &sanitize_component(name), wait)
 }
 
 pub fn configure_child_command(command: &mut Command) {
@@ -122,8 +130,8 @@ fn write_lock_metadata(tool: &str, path: &Path, file: &mut File) -> Result<(), L
     Ok(())
 }
 
-fn acquire_sanitized(tool: &str, wait: bool) -> Result<InvocationLock, LockError> {
-    let path = lock_path(tool);
+fn acquire_sanitized(root: &Path, tool: &str, wait: bool) -> Result<InvocationLock, LockError> {
+    let path = lock_path(root, tool);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| LockError::CreateDir {
             tool: tool.to_owned(),
@@ -180,23 +188,8 @@ fn acquire_sanitized(tool: &str, wait: bool) -> Result<InvocationLock, LockError
     })
 }
 
-fn lock_path(tool: &str) -> PathBuf {
-    lock_root().join(format!("{tool}.lock"))
-}
-
-fn lock_root() -> PathBuf {
-    if let Some(path) = nonempty_env_var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(path).join("capulus");
-    }
-    if let Some(path) = nonempty_env_var_os("HOME").or_else(|| nonempty_env_var_os("USERPROFILE")) {
-        return PathBuf::from(path).join(".capulus").join("locks");
-    }
-    env::temp_dir().join("capulus")
-}
-
-fn nonempty_env_var_os(key: &str) -> Option<OsString> {
-    let value = env::var_os(key)?;
-    if value.is_empty() { None } else { Some(value) }
+fn lock_path(root: &Path, tool: &str) -> PathBuf {
+    root.join(format!("{tool}.lock"))
 }
 
 fn bypass_token(tool: &str) -> OsString {
@@ -265,7 +258,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{LockError, acquire, acquire_named};
+    use super::{LockError, acquire_in, acquire_named_in};
 
     fn unique_tool_name() -> String {
         let now = SystemTime::now()
@@ -277,10 +270,12 @@ mod tests {
 
     #[test]
     fn acquire_without_wait_returns_already_running() {
+        let temp = tempfile::TempDir::new().expect("temp lock root");
+        let root = temp.path().join("locks");
         let tool = unique_tool_name();
-        let first = acquire(&tool, false).expect("acquire first lock");
+        let first = acquire_in(&root, &tool, false).expect("acquire first lock");
         let first_path = first.path().to_path_buf();
-        let second = acquire(&tool, false).expect_err("second acquisition should fail");
+        let second = acquire_in(&root, &tool, false).expect_err("second acquisition should fail");
         assert!(matches!(second, LockError::AlreadyRunning { .. }));
         drop(first);
         fs::remove_file(first_path).ok();
@@ -288,13 +283,17 @@ mod tests {
 
     #[test]
     fn acquire_with_wait_blocks_until_previous_holder_releases() {
+        let temp = tempfile::TempDir::new().expect("temp lock root");
+        let root = temp.path().join("locks");
         let tool = unique_tool_name();
-        let first = acquire(&tool, false).expect("acquire first lock");
+        let first = acquire_in(&root, &tool, false).expect("acquire first lock");
         let (done_tx, done_rx) = mpsc::channel();
         let waiting_tool = tool.clone();
+        let waiting_root = root.clone();
 
         let handle = std::thread::spawn(move || {
-            let second = acquire(&waiting_tool, true).expect("waiting acquisition succeeds");
+            let second = acquire_in(&waiting_root, &waiting_tool, true)
+                .expect("waiting acquisition succeeds");
             done_tx
                 .send(second.path().to_path_buf())
                 .expect("send path");
@@ -317,9 +316,12 @@ mod tests {
 
     #[test]
     fn acquire_named_uses_the_same_lock_namespace_without_bypass() {
+        let temp = tempfile::TempDir::new().expect("temp lock root");
+        let root = temp.path().join("locks");
         let tool = unique_tool_name();
-        let first = acquire_named(&tool, false).expect("acquire first named lock");
-        let second = acquire_named(&tool, false).expect_err("second named acquisition should fail");
+        let first = acquire_named_in(&root, &tool, false).expect("acquire first named lock");
+        let second = acquire_named_in(&root, &tool, false)
+            .expect_err("second named acquisition should fail");
         assert!(matches!(second, LockError::AlreadyRunning { .. }));
         let first_path = first.path().to_path_buf();
         drop(first);
