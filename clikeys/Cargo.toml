@@ -9,4 +9,4 @@ repository.workspace = true
 
 [dependencies]
 thiserror = "2"
-itertools = "0.14"
+itertools = "0.15"
