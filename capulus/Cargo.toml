@@ -1,6 +1,6 @@
 [package]
 name = "capulus"
-version = "0.3.1"
+version = "0.3.2"
 edition.workspace = true
 license.workspace = true
 description = "Shared support helpers for komputation CLI tools."
@@ -22,3 +22,6 @@ thiserror = "2"
 time = { version = "0.3", features = ["parsing"] }
 toml = "1"
 webbrowser = "1"
+
+[dev-dependencies]
+indicatif = { version = "0.18", features = ["in_memory"] }

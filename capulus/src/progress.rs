@@ -589,6 +589,7 @@ fn spawn_interactive_renderer(
                 ProgressBar::new(total)
             }
         };
+        let bar = attach_progress_bar(&progress, bar, None);
         bar.set_style(task_style(&state.options.kind, color));
         bar.set_message(state.render_message(Instant::now()));
         bar.set_position(state.position);
@@ -596,7 +597,6 @@ fn spawn_interactive_renderer(
             bar.enable_steady_tick(TICK_INTERVAL);
         }
         drop(state);
-        let bar = progress.add(bar);
 
         loop {
             let state = shared.state.lock().expect("task state lock");
@@ -729,6 +729,20 @@ fn finish_interactive_bar(bar: &ProgressBar, outcome: TaskOutcome, elapsed: Dura
     }
 }
 
+/// Internalizes a bar before any setter or ticker can draw to its standalone
+/// target. Indicatif setters draw synchronously and steady tickers tick once
+/// immediately, so callers must configure only the returned bar.
+fn attach_progress_bar(
+    progress: &MultiProgress,
+    bar: ProgressBar,
+    before: Option<&ProgressBar>,
+) -> ProgressBar {
+    match before {
+        Some(anchor) => progress.insert_before(anchor, bar),
+        None => progress.add(bar),
+    }
+}
+
 fn render_plain_outcome(output: &dyn LineOutput, state: &TaskState, outcome: TaskOutcome) {
     let elapsed = format_duration(state.started.elapsed());
     match outcome {
@@ -786,17 +800,18 @@ impl LiveGroup {
         }
         let footer = match ui.inner.options.progress {
             ResolvedProgressMode::Interactive => {
-                let bar = ProgressBar::new_spinner();
-                bar.set_style(live_footer_style(ui.color_is_enabled()));
-                bar.set_message(label.clone());
-                bar.enable_steady_tick(TICK_INTERVAL);
-                Some(
+                let bar = attach_progress_bar(
                     ui.inner
                         .progress
                         .as_ref()
-                        .expect("interactive UI owns a MultiProgress")
-                        .add(bar),
-                )
+                        .expect("interactive UI owns a MultiProgress"),
+                    ProgressBar::new_spinner(),
+                    None,
+                );
+                bar.set_style(live_footer_style(ui.color_is_enabled()));
+                bar.set_message(label.clone());
+                bar.enable_steady_tick(TICK_INTERVAL);
+                Some(bar)
             }
             ResolvedProgressMode::Plain => {
                 ui.write_line(&format!("[start] {label}"));
@@ -839,7 +854,17 @@ impl LiveGroup {
     fn create_row(&self, presentation: LiveRowPresentation, message: String) -> Result<LiveRow> {
         let bar = match self.inner.ui.inner.options.progress {
             ResolvedProgressMode::Interactive => {
-                let bar = ProgressBar::new_spinner();
+                let progress = self
+                    .inner
+                    .ui
+                    .inner
+                    .progress
+                    .as_ref()
+                    .expect("interactive UI owns a MultiProgress");
+                let footer = self.inner.footer.lock().expect("live-group footer lock");
+                let bar =
+                    attach_progress_bar(progress, ProgressBar::new_spinner(), footer.as_ref());
+                drop(footer);
                 match &presentation {
                     LiveRowPresentation::Labeled(label) => {
                         bar.set_style(live_row_style(self.inner.ui.color_is_enabled()));
@@ -851,18 +876,7 @@ impl LiveGroup {
                 }
                 bar.set_message(message.clone());
                 bar.enable_steady_tick(TICK_INTERVAL);
-                let progress = self
-                    .inner
-                    .ui
-                    .inner
-                    .progress
-                    .as_ref()
-                    .expect("interactive UI owns a MultiProgress");
-                let footer = self.inner.footer.lock().expect("live-group footer lock");
-                Some(match footer.as_ref() {
-                    Some(footer) => progress.insert_before(footer, bar),
-                    None => progress.add(bar),
-                })
+                Some(bar)
             }
             ResolvedProgressMode::Plain => {
                 self.inner
@@ -1198,6 +1212,8 @@ fn format_seconds(seconds: u64) -> String {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use indicatif::{InMemoryTerm, ProgressDrawTarget};
+
     use super::*;
 
     #[derive(Default)]
@@ -1230,6 +1246,30 @@ mod tests {
             .expect("plain UI options"),
             output,
         )
+    }
+
+    #[test]
+    fn progress_bar_is_attached_before_configuration_can_draw() {
+        let detached_terminal = InMemoryTerm::new(8, 80);
+        let attached_terminal = InMemoryTerm::new(8, 80);
+        let progress = MultiProgress::with_draw_target(ProgressDrawTarget::term_like(Box::new(
+            attached_terminal.clone(),
+        )));
+        let bar = ProgressBar::with_draw_target(
+            None,
+            ProgressDrawTarget::term_like(Box::new(detached_terminal.clone())),
+        );
+
+        let bar = attach_progress_bar(&progress, bar, None);
+        bar.set_style(live_footer_style(false));
+        bar.set_message("Checking hosts");
+        bar.enable_steady_tick(TICK_INTERVAL);
+        thread::sleep(TICK_INTERVAL);
+        bar.disable_steady_tick();
+
+        assert!(detached_terminal.contents().is_empty());
+        assert!(attached_terminal.contents().contains("Checking hosts"));
+        bar.finish_and_clear();
     }
 
     #[test]
