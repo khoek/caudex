@@ -8,6 +8,12 @@ use dialoguer::theme::ColorfulTheme;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
+pub use crate::progress::{
+    CancellationMode, ColorMode, LiveGroup, LiveRow, ProgressMode, Task, TaskKind, TaskOptions,
+    TaskVisibility, Ui, UiOptions, ValidatedUiOptions, format_duration,
+};
+pub use crate::{Cancellation, Cancelled};
+
 const ANSI_BLUE: &str = "\x1b[34m";
 const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
@@ -61,6 +67,11 @@ pub struct StdoutRenderTarget;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StderrRenderTarget;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ConfiguredRenderTarget {
+    color: bool,
+}
+
 pub fn stdin_is_interactive() -> bool {
     io::stdin().is_terminal()
 }
@@ -105,6 +116,23 @@ pub fn stdout_render_target() -> StdoutRenderTarget {
 
 pub fn stderr_render_target() -> StderrRenderTarget {
     StderrRenderTarget
+}
+
+impl Ui {
+    /// Returns a renderer that follows this invocation's resolved color mode.
+    pub fn render_target(&self) -> ConfiguredRenderTarget {
+        ConfiguredRenderTarget {
+            color: self.color_is_enabled(),
+        }
+    }
+
+    /// Returns a stdout renderer that follows the invocation color policy
+    /// without adding terminal escapes to redirected payload output in auto mode.
+    pub fn stdout_render_target(&self) -> ConfiguredRenderTarget {
+        ConfiguredRenderTarget {
+            color: self.stdout_color_is_enabled(),
+        }
+    }
 }
 
 pub fn spinner_style(template: &str) -> ProgressStyle {
@@ -250,6 +278,12 @@ impl RenderTarget for StdoutRenderTarget {
 impl RenderTarget for StderrRenderTarget {
     fn style(&self, text: &str, color: Option<Color>, effect: TextEffect) -> String {
         style_for_terminal(text, color, effect, stderr_is_interactive())
+    }
+}
+
+impl RenderTarget for ConfiguredRenderTarget {
+    fn style(&self, text: &str, color: Option<Color>, effect: TextEffect) -> String {
+        style_for_terminal(text, color, effect, self.color)
     }
 }
 

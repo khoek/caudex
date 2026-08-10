@@ -11,7 +11,9 @@ use std::time::Duration;
 use fs2::FileExt;
 use indicatif::ProgressBar;
 
-use crate::ui::{print_notice, spinner, stderr_is_interactive};
+use crate::ui::{
+    Task, TaskOptions, TaskVisibility, Ui, print_notice, spinner, stderr_is_interactive,
+};
 
 const BYPASS_ENV_VAR: &str = "CAPULUS_SINGLE_INSTANCE_BYPASS";
 const LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -58,6 +60,14 @@ pub enum LockError {
         #[source]
         source: io::Error,
     },
+
+    #[error("interrupted while waiting for `{tool}` lock at {path}")]
+    Interrupted {
+        tool: String,
+        path: String,
+        #[source]
+        source: crate::Cancelled,
+    },
 }
 
 pub fn acquire_in(
@@ -72,7 +82,23 @@ pub fn acquire_in(
         let path = lock_path(root.as_ref(), &tool);
         return Ok(InvocationLock { _file: None, path });
     }
-    acquire_sanitized(root.as_ref(), &tool, wait)
+    acquire_sanitized(root.as_ref(), &tool, wait, None)
+}
+
+pub fn acquire_in_with_ui(
+    root: impl AsRef<Path>,
+    tool: &str,
+    wait: bool,
+    ui: &Ui,
+) -> Result<InvocationLock, LockError> {
+    let tool = sanitize_component(tool);
+    let token = bypass_token(&tool);
+    let _ = ACTIVE_BYPASS_TOKEN.set(token.clone());
+    if env::var_os(BYPASS_ENV_VAR).as_ref() == Some(&token) {
+        let path = lock_path(root.as_ref(), &tool);
+        return Ok(InvocationLock { _file: None, path });
+    }
+    acquire_sanitized(root.as_ref(), &tool, wait, Some(ui))
 }
 
 pub fn acquire_named_in(
@@ -80,7 +106,16 @@ pub fn acquire_named_in(
     name: &str,
     wait: bool,
 ) -> Result<InvocationLock, LockError> {
-    acquire_sanitized(root.as_ref(), &sanitize_component(name), wait)
+    acquire_sanitized(root.as_ref(), &sanitize_component(name), wait, None)
+}
+
+pub fn acquire_named_in_with_ui(
+    root: impl AsRef<Path>,
+    name: &str,
+    wait: bool,
+    ui: &Ui,
+) -> Result<InvocationLock, LockError> {
+    acquire_sanitized(root.as_ref(), &sanitize_component(name), wait, Some(ui))
 }
 
 pub fn configure_child_command(command: &mut Command) {
@@ -130,7 +165,12 @@ fn write_lock_metadata(tool: &str, path: &Path, file: &mut File) -> Result<(), L
     Ok(())
 }
 
-fn acquire_sanitized(root: &Path, tool: &str, wait: bool) -> Result<InvocationLock, LockError> {
+fn acquire_sanitized(
+    root: &Path,
+    tool: &str,
+    wait: bool,
+    ui: Option<&Ui>,
+) -> Result<InvocationLock, LockError> {
     let path = lock_path(root, tool);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| LockError::CreateDir {
@@ -152,7 +192,7 @@ fn acquire_sanitized(root: &Path, tool: &str, wait: bool) -> Result<InvocationLo
             source,
         })?;
 
-    let mut wait_ui = LockWaitUi::new(tool, &path);
+    let mut wait_ui = LockWaitUi::new(tool, &path, ui.cloned());
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => {
@@ -169,7 +209,10 @@ fn acquire_sanitized(root: &Path, tool: &str, wait: bool) -> Result<InvocationLo
                     });
                 }
                 wait_ui.show();
-                thread::sleep(LOCK_WAIT_POLL_INTERVAL);
+                if let Err(error) = wait_ui.sleep() {
+                    wait_ui.abandon();
+                    return Err(error);
+                }
             }
             Err(source) => {
                 wait_ui.clear();
@@ -213,24 +256,45 @@ fn sanitize_component(value: &str) -> String {
 }
 
 struct LockWaitUi {
+    tool: String,
+    path: String,
     message: String,
+    ui: Option<Ui>,
+    task: Option<Task>,
     progress: Option<ProgressBar>,
     notice_printed: bool,
 }
 
 impl LockWaitUi {
-    fn new(tool: &str, path: &Path) -> Self {
+    fn new(tool: &str, path: &Path, ui: Option<Ui>) -> Self {
         Self {
+            tool: tool.to_owned(),
+            path: path.display().to_string(),
             message: format!(
                 "Waiting for another `{tool}` invocation to finish ({})",
                 path.display()
             ),
+            ui,
+            task: None,
             progress: None,
             notice_printed: false,
         }
     }
 
     fn show(&mut self) {
+        if let Some(ui) = self.ui.as_ref() {
+            if self.task.is_none() {
+                self.task = Some(
+                    ui.task(TaskOptions {
+                        label: self.message.clone(),
+                        visibility: TaskVisibility::Immediate,
+                        ..TaskOptions::default()
+                    })
+                    .expect("lock wait task is valid"),
+                );
+            }
+            return;
+        }
         if let Some(progress) = &self.progress {
             progress.tick();
             return;
@@ -246,8 +310,34 @@ impl LockWaitUi {
     }
 
     fn clear(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.finish_and_clear();
+        }
         if let Some(progress) = self.progress.take() {
             progress.finish_and_clear();
+        }
+    }
+
+    fn abandon(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abandon("Lock wait interrupted");
+        }
+    }
+
+    fn sleep(&self) -> Result<(), LockError> {
+        match self.ui.as_ref() {
+            Some(ui) => {
+                ui.sleep(LOCK_WAIT_POLL_INTERVAL)
+                    .map_err(|source| LockError::Interrupted {
+                        tool: self.tool.clone(),
+                        path: self.path.clone(),
+                        source,
+                    })
+            }
+            None => {
+                thread::sleep(LOCK_WAIT_POLL_INTERVAL);
+                Ok(())
+            }
         }
     }
 }
