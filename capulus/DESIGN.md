@@ -132,12 +132,18 @@ file, and no credential or CA bytes are stored beneath `/var/lib`.
 
 Each transient worker declares its exact volatile job boundary as a nested systemd
 `RuntimeDirectory` at mode 0711, so systemd removes it when the unit stops even after abnormal
-termination. capulus also scrubs that boundary as soon as Cargo returns, runs version verification
-even if scrubbing reports an error, and removes volatile state before persistent build state on
-every normal return. Startup and inactive-job recovery validate both roots before deletion and fail
-closed on unexpected names, links, ownership, or modes. The coordinator clears a terminal active
-record synchronously; a nonterminal active job is monitored through systemd without acquiring the
-global build lock while its worker remains live.
+termination. capulus scrubs every file inside that boundary as soon as Cargo returns, leaves the
+systemd-owned directory itself for PID 1 to unmount and remove when the worker exits, runs version
+verification even if scrubbing reports an error, and removes volatile state before persistent build
+state on every normal return. Startup and inactive-job recovery validate both roots before deletion
+and fail closed on unexpected names, links, ownership, or modes. A runtime-only boundary may belong
+to another product's transient worker waiting for the global lock, so recovery preserves it for PID
+1; process-managed crash state is removed only when its matching persistent job boundary proves
+that it is not a waiting systemd workspace. If a terminated worker's runtime mount is still being
+released, recovery scrubs its volatile files but retains the matching persistent boundary and
+retries after PID 1 finishes the unmount. The coordinator clears a terminal active record
+synchronously; a nonterminal active job is monitored through systemd without acquiring the global
+build lock while its worker remains live.
 
 ## Redeploy state and liveness
 

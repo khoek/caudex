@@ -1,12 +1,17 @@
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Seek};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::fs::{Mode, RawDir, StatVfsMountFlags, fstatvfs, mkdirat, symlinkat};
+use rustix::fs::{
+    AtFlags, Mode, RawDir, StatVfsMountFlags, fstatvfs, mkdirat, symlinkat, unlinkat,
+};
 
 use super::account::{
     DirectoryIdentity, DirectoryOwner, SupplementaryGroups, UnixAccount, ensure_root_directory,
@@ -24,6 +29,8 @@ const USER_INSTALL_RUNTIME_ROOT: &str = "/run/capulus/user-installs";
 const CARGO_CONFIG: &str = "config.toml";
 const CARGO_CREDENTIALS: &str = "credentials.toml";
 const REGISTRY_CA: &str = "registry-ca.pem";
+const ORPHAN_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const ORPHAN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub fn reinstall_user_cli(
     product: &ManagedProduct,
@@ -32,9 +39,9 @@ pub fn reinstall_user_cli(
     context: &UserInstallContext,
 ) -> Result<()> {
     let _lock = acquire_managed_build_lock()?;
-    remove_orphaned_user_installations()?;
+    remove_orphaned_user_installations_until_available()?;
     BuildAccount::ensure()?.reclaim_target_home()?;
-    let mut workspace = PreparedUserInstall::prepare(product, job, context)?;
+    let mut workspace = PreparedUserInstall::prepare_process_managed(product, job, context)?;
     let attempt = workspace.reinstall_and_verify(product, release, context);
     combine_results(attempt.result, workspace.cleanup())
 }
@@ -51,6 +58,13 @@ pub(super) struct PreparedUserInstall {
     boundary_owner: DirectoryOwner,
     state_present: bool,
     runtime_present: bool,
+    runtime_management: RuntimeManagement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeManagement {
+    Process,
+    Systemd,
 }
 
 pub(super) struct UserReinstallAttempt {
@@ -80,6 +94,23 @@ impl PreparedUserInstall {
         job: JobId,
         context: &UserInstallContext,
     ) -> Result<Self> {
+        Self::prepare_managed(product, job, context, RuntimeManagement::Systemd)
+    }
+
+    fn prepare_process_managed(
+        product: &ManagedProduct,
+        job: JobId,
+        context: &UserInstallContext,
+    ) -> Result<Self> {
+        Self::prepare_managed(product, job, context, RuntimeManagement::Process)
+    }
+
+    fn prepare_managed(
+        product: &ManagedProduct,
+        job: JobId,
+        context: &UserInstallContext,
+        runtime_management: RuntimeManagement,
+    ) -> Result<Self> {
         require_root()?;
         ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
         let account = context.revalidate(&product.user_binary().cargo_name)?;
@@ -90,6 +121,7 @@ impl PreparedUserInstall {
             job,
             account,
             DirectoryOwner::ROOT,
+            runtime_management,
         )
     }
 
@@ -100,6 +132,7 @@ impl PreparedUserInstall {
         job: JobId,
         account: UnixAccount,
         boundary_owner: DirectoryOwner,
+        runtime_management: RuntimeManagement,
     ) -> Result<Self> {
         let state_directory = WorkspaceRoot::ensure(state_root, boundary_owner)?;
         require_executable_filesystem(state_root, fstatvfs(&state_directory.directory)?.f_flag)?;
@@ -118,6 +151,7 @@ impl PreparedUserInstall {
             boundary_owner,
             state_present: false,
             runtime_present: false,
+            runtime_management,
         };
         let result = (|| {
             state_directory.create_job(&name, ExistingJob::Reject)?;
@@ -235,12 +269,19 @@ impl PreparedUserInstall {
         if !self.runtime_present {
             return Ok(());
         }
-        remove_known_workspace(
-            &self.runtime_root,
-            &self.runtime_job,
-            self.boundary_owner,
-            WorkspaceKind::Runtime,
-        )?;
+        match self.runtime_management {
+            RuntimeManagement::Process => remove_known_workspace(
+                &self.runtime_root,
+                &self.runtime_job,
+                self.boundary_owner,
+                WorkspaceKind::Runtime,
+            )?,
+            RuntimeManagement::Systemd => scrub_systemd_runtime_workspace(
+                &self.runtime_root,
+                &self.runtime_job,
+                self.boundary_owner,
+            )?,
+        }
         self.runtime_present = false;
         Ok(())
     }
@@ -491,6 +532,45 @@ fn remove_known_workspace(
     root.directory.sync_all().map_err(Into::into)
 }
 
+fn scrub_systemd_runtime_workspace(
+    root: &Path,
+    workspace: &Path,
+    boundary_owner: DirectoryOwner,
+) -> Result<()> {
+    if workspace.parent() != Some(root) {
+        bail!("Capulus user-install cleanup path escaped its root");
+    }
+    let name = workspace
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("Capulus user-install workspace name is not UTF-8"))?;
+    validate_workspace_name(name)?;
+    let root = WorkspaceRoot::ensure(root, boundary_owner)?;
+    let directory = root.open_job(name)?;
+    scrub_runtime_workspace(&directory)
+}
+
+fn scrub_runtime_workspace(directory: &File) -> Result<()> {
+    scrub_runtime_entries(
+        directory,
+        validate_workspace_entries(directory, WorkspaceKind::Runtime)?,
+    )
+}
+
+fn scrub_runtime_entries(directory: &File, entries: Vec<String>) -> Result<()> {
+    for entry in entries {
+        match unlinkat(directory, &entry, AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(error) => {
+                return Err(std::io::Error::from(error)).with_context(|| {
+                    format!("failed to scrub volatile user-install file {entry:?}")
+                });
+            }
+        }
+    }
+    directory.sync_all().map_err(Into::into)
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum WorkspaceKind {
     State,
@@ -502,31 +582,103 @@ fn validate_workspace_directory(
     name: &str,
     boundary_owner: DirectoryOwner,
     kind: WorkspaceKind,
-) -> Result<()> {
+) -> Result<bool> {
     let directory = open_directory_at(root, OsStr::new(name))
         .with_context(|| format!("failed to open user-install workspace {name}"))?;
+    validate_open_workspace_directory(&directory, name, boundary_owner, kind)
+        .map(|validation| validation.legacy_runtime)
+}
+
+struct WorkspaceValidation {
+    legacy_runtime: bool,
+    entries: Vec<String>,
+}
+
+fn validate_open_workspace_directory(
+    directory: &File,
+    name: &str,
+    boundary_owner: DirectoryOwner,
+    kind: WorkspaceKind,
+) -> Result<WorkspaceValidation> {
     let identity = DirectoryIdentity::from_metadata(&directory.metadata()?);
     if kind == WorkspaceKind::Runtime
         && identity.is_directory_owned_by_other_uid(boundary_owner, 0o700)
     {
-        return Ok(());
+        return Ok(WorkspaceValidation {
+            legacy_runtime: true,
+            entries: Vec::new(),
+        });
     }
     if identity.is_restricted(boundary_owner, 0o711) {
-        require_empty_directory(&directory, Path::new(name))?;
-        return Ok(());
+        require_empty_directory(directory, Path::new(name))?;
+        return Ok(WorkspaceValidation {
+            legacy_runtime: false,
+            entries: Vec::new(),
+        });
     }
     if !identity.is_owned_directory(boundary_owner, 0o711) {
         bail!("user-install workspace boundary has invalid ownership or mode: {name:?}");
     }
-    for entry in directory_names(&directory)? {
+    Ok(WorkspaceValidation {
+        legacy_runtime: false,
+        entries: validate_workspace_entries(directory, kind)?,
+    })
+}
+
+struct ValidatedRuntimeWorkspace {
+    name: String,
+    directory: File,
+    legacy: bool,
+    entries: Vec<String>,
+}
+
+fn validate_runtime_workspace(
+    root: &File,
+    name: String,
+    boundary_owner: DirectoryOwner,
+) -> Result<Option<ValidatedRuntimeWorkspace>> {
+    let directory = match open_directory_at(root, OsStr::new(&name)) {
+        Ok(directory) => directory,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open user-install workspace {name}"));
+        }
+    };
+    let validation = validate_open_workspace_directory(
+        &directory,
+        &name,
+        boundary_owner,
+        WorkspaceKind::Runtime,
+    )?;
+    Ok(Some(ValidatedRuntimeWorkspace {
+        name,
+        directory,
+        legacy: validation.legacy_runtime,
+        entries: validation.entries,
+    }))
+}
+
+fn validate_workspace_entries(directory: &File, kind: WorkspaceKind) -> Result<Vec<String>> {
+    let entries = directory_names(directory)?;
+    let mut validated = Vec::with_capacity(entries.len());
+    for entry in entries {
         match kind {
             WorkspaceKind::State if matches!(entry.as_str(), "cargo" | "target") => {
-                open_directory_at(&directory, OsStr::new(&entry)).with_context(|| {
+                open_directory_at(directory, OsStr::new(&entry)).with_context(|| {
                     format!("user-install state entry is not a real directory: {entry:?}")
                 })?;
+                validated.push(entry);
             }
             WorkspaceKind::State if entry == "installed-version.txt" => {
-                require_regular_file(&directory, &entry)?;
+                require_regular_file(directory, &entry)?;
+                validated.push(entry);
             }
             WorkspaceKind::Runtime
                 if matches!(
@@ -534,14 +686,16 @@ fn validate_workspace_directory(
                     CARGO_CONFIG | CARGO_CREDENTIALS | REGISTRY_CA
                 ) =>
             {
-                require_regular_file(&directory, &entry)?;
+                if require_regular_file_if_present(directory, &entry)? {
+                    validated.push(entry);
+                }
             }
             _ => {
                 bail!("user-install workspace contains an unexpected entry: {entry:?}");
             }
         }
     }
-    Ok(())
+    Ok(validated)
 }
 
 fn require_regular_file(parent: &File, name: &str) -> Result<()> {
@@ -550,6 +704,21 @@ fn require_regular_file(parent: &File, name: &str) -> Result<()> {
         bail!("user-install workspace entry is not a regular file: {name:?}");
     }
     Ok(())
+}
+
+fn require_regular_file_if_present(parent: &File, name: &str) -> Result<bool> {
+    match open_file_at(parent, OsStr::new(name)) {
+        Ok(file) if file.metadata()?.file_type().is_file() => Ok(true),
+        Ok(_) => bail!("user-install workspace entry is not a regular file: {name:?}"),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn directory_names(directory: &File) -> Result<Vec<String>> {
@@ -598,7 +767,7 @@ fn read_bounded_output(file: &mut File, limit: u64) -> Result<String> {
     Ok(value)
 }
 
-pub(super) fn remove_orphaned_user_installations() -> Result<()> {
+pub(super) fn remove_orphaned_user_installations() -> Result<CleanupDisposition> {
     remove_orphaned_user_installations_at(
         Path::new(USER_INSTALL_STATE_ROOT),
         Path::new(USER_INSTALL_RUNTIME_ROOT),
@@ -616,6 +785,7 @@ pub(super) fn remove_orphaned_user_installations_for_job(product: &str, job: Job
         DirectoryOwner::ROOT,
         Some(&name),
     )
+    .map(|_| ())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -628,8 +798,24 @@ pub(super) fn cleanup_inactive_user_installations() -> Result<CleanupDisposition
     let Some(_lock) = try_acquire_managed_build_lock()? else {
         return Ok(CleanupDisposition::Busy);
     };
-    remove_orphaned_user_installations()?;
-    Ok(CleanupDisposition::Complete)
+    remove_orphaned_user_installations()
+}
+
+fn remove_orphaned_user_installations_until_available() -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match remove_orphaned_user_installations()? {
+            CleanupDisposition::Complete => return Ok(()),
+            CleanupDisposition::Busy if started.elapsed() < ORPHAN_CLEANUP_TIMEOUT => {
+                thread::sleep(ORPHAN_CLEANUP_RETRY_INTERVAL);
+            }
+            CleanupDisposition::Busy => {
+                bail!(
+                    "timed out waiting for systemd to release a prior Capulus user-install workspace"
+                );
+            }
+        }
+    }
 }
 
 fn remove_orphaned_user_installations_at(
@@ -637,35 +823,80 @@ fn remove_orphaned_user_installations_at(
     runtime_root: &Path,
     boundary_owner: DirectoryOwner,
     preserved_runtime_job: Option<&str>,
-) -> Result<()> {
+) -> Result<CleanupDisposition> {
+    remove_orphaned_user_installations_at_with(
+        state_root,
+        runtime_root,
+        boundary_owner,
+        preserved_runtime_job,
+        |path| fs::remove_dir_all(path),
+    )
+}
+
+fn remove_orphaned_user_installations_at_with(
+    state_root: &Path,
+    runtime_root: &Path,
+    boundary_owner: DirectoryOwner,
+    preserved_runtime_job: Option<&str>,
+    mut remove_runtime: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<CleanupDisposition> {
     let state = WorkspaceRoot::ensure(state_root, boundary_owner)?;
     let runtime = WorkspaceRoot::ensure(runtime_root, boundary_owner)?;
-    let state_names = workspace_names(&state.directory)?;
+    let state_names = workspace_names(&state.directory)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let runtime_names = workspace_names(&runtime.directory)?;
     for name in &state_names {
         validate_workspace_directory(&state.directory, name, boundary_owner, WorkspaceKind::State)?;
     }
-    for name in &runtime_names {
-        validate_workspace_directory(
-            &runtime.directory,
-            name,
-            boundary_owner,
-            WorkspaceKind::Runtime,
-        )?;
-    }
+    let mut runtime_workspaces = Vec::new();
     for name in runtime_names {
-        if preserved_runtime_job == Some(&name) {
+        if let Some(workspace) =
+            validate_runtime_workspace(&runtime.directory, name, boundary_owner)?
+        {
+            runtime_workspaces.push(workspace);
+        }
+    }
+    let mut deferred_state_names = BTreeSet::new();
+    for workspace in runtime_workspaces {
+        if preserved_runtime_job == Some(workspace.name.as_str())
+            || (!state_names.contains(&workspace.name) && !workspace.legacy)
+        {
             continue;
         }
-        fs::remove_dir_all(runtime.path.join(&name))
-            .with_context(|| format!("failed to remove orphaned user installation {name}"))?;
+        if !workspace.legacy {
+            scrub_runtime_entries(&workspace.directory, workspace.entries)?;
+        }
+        match remove_runtime(&runtime.path.join(&workspace.name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ResourceBusy => {
+                deferred_state_names.insert(workspace.name);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove orphaned user installation {}",
+                        workspace.name
+                    )
+                });
+            }
+        }
     }
     runtime.directory.sync_all()?;
     for name in state_names {
+        if deferred_state_names.contains(&name) {
+            continue;
+        }
         fs::remove_dir_all(state.path.join(&name))
             .with_context(|| format!("failed to remove orphaned user installation {name}"))?;
     }
-    state.directory.sync_all().map_err(Into::into)
+    state.directory.sync_all()?;
+    Ok(if deferred_state_names.is_empty() {
+        CleanupDisposition::Complete
+    } else {
+        CleanupDisposition::Busy
+    })
 }
 
 fn combine_results(first: Result<()>, second: Result<()>) -> Result<()> {
@@ -840,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn systemd_precreated_empty_runtime_workspace_is_adopted() {
+    fn systemd_runtime_workspace_is_scrubbed_without_removing_its_mount_boundary() {
         let temporary = tempfile::tempdir().unwrap();
         let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
         let boundary_owner = DirectoryOwner::of(&account);
@@ -857,16 +1088,29 @@ mod tests {
             &runtime_root,
             "a",
             JobId::parse("0123456789abcdef0123456789abcdef").unwrap(),
-            account,
+            account.clone(),
             boundary_owner,
+            RuntimeManagement::Systemd,
         )
         .unwrap();
+        workspace
+            .populate_runtime_configuration(&CargoRegistry::CratesIo, &account)
+            .unwrap();
+        assert!(workspace.runtime_job.join(CARGO_CONFIG).is_file());
         assert_owned_mode(&workspace.runtime_job, boundary_owner, 0o711);
         workspace.cleanup().unwrap();
+        assert_owned_mode(&workspace.runtime_job, boundary_owner, 0o711);
+        assert!(
+            fs::read_dir(&workspace.runtime_job)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        fs::remove_dir(&workspace.runtime_job).unwrap();
     }
 
     #[test]
-    fn orphan_cleanup_preserves_the_active_systemd_runtime_workspace() {
+    fn orphan_cleanup_preserves_current_and_foreign_systemd_runtime_workspaces() {
         let temporary = tempfile::tempdir().unwrap();
         let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
         let boundary_owner = DirectoryOwner::of(&account);
@@ -877,6 +1121,9 @@ mod tests {
         let name = "a-0123456789abcdef0123456789abcdef";
         runtime.create_job(name, ExistingJob::Reject).unwrap();
         runtime.secure_job(name).unwrap();
+        let foreign = "b-11111111111111111111111111111111";
+        runtime.create_job(foreign, ExistingJob::Reject).unwrap();
+        runtime.secure_job(foreign).unwrap();
 
         remove_orphaned_user_installations_at(
             &state_root,
@@ -887,7 +1134,37 @@ mod tests {
         .unwrap();
 
         assert_owned_mode(&runtime_root.join(name), boundary_owner, 0o711);
+        assert_owned_mode(&runtime_root.join(foreign), boundary_owner, 0o711);
         fs::remove_dir(runtime_root.join(name)).unwrap();
+        fs::remove_dir(runtime_root.join(foreign)).unwrap();
+    }
+
+    #[test]
+    fn a_runtime_workspace_removed_by_systemd_during_validation_is_absent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
+        let boundary_owner = DirectoryOwner::of(&account);
+        let runtime =
+            WorkspaceRoot::ensure(&temporary.path().join("runtime"), boundary_owner).unwrap();
+
+        assert!(
+            validate_runtime_workspace(
+                &runtime.directory,
+                "a-0123456789abcdef0123456789abcdef".to_string(),
+                boundary_owner,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn volatile_file_disappearance_during_systemd_teardown_is_successful() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = File::open(temporary.path()).unwrap();
+
+        assert!(!require_regular_file_if_present(&directory, CARGO_CONFIG).unwrap());
+        scrub_runtime_entries(&directory, vec![CARGO_CONFIG.to_string()]).unwrap();
     }
 
     #[test]
@@ -959,7 +1236,61 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_empty_root_creation_and_boundary_owned_jobs_are_recovered() {
+    fn busy_systemd_mount_defers_its_matching_persistent_workspace() {
+        let temporary = tempfile::tempdir().unwrap();
+        let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
+        let mut workspace = test_workspace(temporary.path(), account.clone());
+        workspace
+            .populate_runtime_configuration(&CargoRegistry::CratesIo, &account)
+            .unwrap();
+        let state_root = workspace.state_root.clone();
+        let runtime_root = workspace.runtime_root.clone();
+        let state_job = workspace.state_job.clone();
+        let runtime_job = workspace.runtime_job.clone();
+        let boundary_owner = workspace.test_boundary_owner();
+        assert_owned_mode(&runtime_job, boundary_owner, 0o711);
+        workspace.state_present = false;
+        workspace.runtime_present = false;
+        drop(workspace);
+
+        assert_eq!(
+            remove_orphaned_user_installations_at_with(
+                &state_root,
+                &runtime_root,
+                boundary_owner,
+                None,
+                |path| {
+                    assert_eq!(path, runtime_job);
+                    Err(std::io::ErrorKind::ResourceBusy.into())
+                },
+            )
+            .unwrap(),
+            CleanupDisposition::Busy
+        );
+        assert!(state_job.is_dir());
+        assert!(runtime_job.is_dir());
+        let runtime_entries = fs::read_dir(&runtime_job)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(runtime_entries.is_empty(), "{runtime_entries:?}");
+
+        assert_eq!(
+            remove_orphaned_user_installations_at(
+                &state_root,
+                &runtime_root,
+                boundary_owner,
+                None,
+            )
+            .unwrap(),
+            CleanupDisposition::Complete
+        );
+        assert!(fs::read_dir(state_root).unwrap().next().is_none());
+        assert!(fs::read_dir(runtime_root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn interrupted_roots_and_state_jobs_recover_while_runtime_only_jobs_are_preserved() {
         let temporary = tempfile::tempdir().unwrap();
         let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
         let boundary_owner = test_boundary_owner(&account);
@@ -975,26 +1306,24 @@ mod tests {
             JobId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             account,
             boundary_owner,
+            RuntimeManagement::Process,
         )
         .unwrap();
         assert_owned_mode(&state_root, boundary_owner, 0o711);
         assert_owned_mode(&runtime_root, boundary_owner, 0o711);
         workspace.cleanup().unwrap();
 
-        create_owned_directory(
-            &state_root.join("a-00000000000000000000000000000000"),
-            boundary_owner,
-            0o700,
-        );
-        create_owned_directory(
-            &runtime_root.join("a-11111111111111111111111111111111"),
-            boundary_owner,
-            0o500,
-        );
+        let interrupted_name = "a-00000000000000000000000000000000";
+        create_owned_directory(&state_root.join(interrupted_name), boundary_owner, 0o700);
+        create_owned_directory(&runtime_root.join(interrupted_name), boundary_owner, 0o500);
+        let runtime_job = runtime_root.join("a-11111111111111111111111111111111");
+        create_owned_directory(&runtime_job, boundary_owner, 0o500);
         remove_orphaned_user_installations_at(&state_root, &runtime_root, boundary_owner, None)
             .unwrap();
         assert!(fs::read_dir(state_root).unwrap().next().is_none());
-        assert!(fs::read_dir(runtime_root).unwrap().next().is_none());
+        assert!(!runtime_root.join(interrupted_name).exists());
+        assert_owned_mode(&runtime_job, boundary_owner, 0o500);
+        fs::remove_dir(runtime_job).unwrap();
     }
 
     #[test]
@@ -1061,13 +1390,15 @@ mod tests {
             gid: actual_owner.gid,
         };
 
-        validate_workspace_directory(
-            &root.directory,
-            name,
-            boundary_owner,
-            WorkspaceKind::Runtime,
-        )
-        .unwrap();
+        assert!(
+            validate_workspace_directory(
+                &root.directory,
+                name,
+                boundary_owner,
+                WorkspaceKind::Runtime,
+            )
+            .unwrap()
+        );
         assert!(
             validate_workspace_directory(
                 &root.directory,
@@ -1174,6 +1505,7 @@ mod tests {
             JobId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             account,
             boundary_owner,
+            RuntimeManagement::Process,
         )
         .unwrap()
     }
