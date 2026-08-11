@@ -45,7 +45,7 @@ request bodies.
 - `/var/lib/capulus/installations/<product>/uninstall.json` journals recoverable removal. Managed
   files first move to same-filesystem private backups; systemd is reloaded before removal is marked
   committed, and interrupted pre-commit removal restores both files and prior enablement.
-- `/run/capulus-user-installs` holds an invoking user's ephemeral Cargo configuration. The user's
+- `/run/capulus/user-installs` holds an invoking user's ephemeral Cargo configuration. The user's
   own Cargo/Rustup run through `setpriv` with the NSS UID, primary GID, initialized supplementary
   groups, cleared environment, exact package version, and original Cargo install root.
 

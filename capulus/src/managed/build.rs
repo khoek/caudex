@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use super::account::{ensure_owned_directory, require_root};
 use super::{BuildAccount, InstallationManifest, ManagedProduct, RedeployRequest, UnixAccount};
 
-const GLOBAL_BUILD_LOCK_ROOT: &str = "/run/lock/capulus";
+const GLOBAL_BUILD_LOCK_ROOT: &str = "/run/capulus/locks";
 const GLOBAL_BUILD_LOCK_NAME: &str = "managed-build";
 const RUSTUP_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 const TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);

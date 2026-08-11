@@ -13,7 +13,7 @@ use super::{
 
 const STATE_ROOT: &str = "/var/lib/capulus/jobs";
 const RUNTIME_ROOT: &str = "/run/capulus/jobs";
-const LOCK_ROOT: &str = "/run/lock/capulus";
+const LOCK_ROOT: &str = "/run/capulus/locks";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

@@ -421,9 +421,10 @@ impl ManagedProduct {
              ExecStart={}{}\n\
              Restart=always\n\
              RestartSec={}s\n\
-             RuntimeDirectory={}\n\
+             RuntimeDirectory={} capulus\n\
              RuntimeDirectoryMode=0755\n\
-             StateDirectory={}\n\
+             RuntimeDirectoryPreserve=yes\n\
+             StateDirectory={} capulus\n\
              StateDirectoryMode=0700\n\
              {hardening}\
              \n\
@@ -862,6 +863,9 @@ mod tests {
         assert!(!text.contains("ListenStream=\""));
         assert!(text.contains("Requires=auc-agent.socket auc-capulus.socket"));
         assert!(text.contains("ProtectHome=read-only"));
+        assert!(text.contains("RuntimeDirectory=auc capulus"));
+        assert!(text.contains("RuntimeDirectoryPreserve=yes"));
+        assert!(text.contains("StateDirectory=auc capulus"));
         assert!(text.contains("DeviceAllow=\"/dev/uhid\" rw"));
     }
 

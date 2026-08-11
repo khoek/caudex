@@ -13,7 +13,7 @@ use super::account::require_root;
 use super::build::run_with_deadline;
 use super::{CargoRegistry, JobId, ManagedProduct, ResolvedRelease, UserInstallContext};
 
-const USER_INSTALL_ROOT: &str = "/run/capulus-user-installs";
+const USER_INSTALL_ROOT: &str = "/run/capulus/user-installs";
 
 pub fn reinstall_user_cli(
     product: &ManagedProduct,
