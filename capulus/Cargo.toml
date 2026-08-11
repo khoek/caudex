@@ -1,27 +1,48 @@
 [package]
 name = "capulus"
-version = "0.3.2"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 description = "Shared support helpers for komputation CLI tools."
 repository.workspace = true
 readme = "README.md"
 
+[features]
+default = []
+managed-client = ["dep:ciborium", "dep:rustix"]
+managed-system = [
+    "managed-client",
+    "dep:reqwest",
+    "dep:semver",
+    "dep:sha2",
+    "dep:systemd-zbus",
+    "dep:tokio",
+    "dep:zbus",
+]
+
 [dependencies]
 anyhow = "1"
+ciborium = { version = "0.2", optional = true }
 dialoguer = "0.12"
 dirs = "6"
 fs2 = "0.4"
 indicatif = "0.18"
 libc = "0.2"
 rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
+rustix = { version = "1", features = ["fs", "net", "process"], optional = true }
+semver = { version = "1", features = ["serde"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "0.11", optional = true }
+systemd-zbus = { version = "5", default-features = false, optional = true }
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 toml = "1"
 webbrowser = "1"
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
 
 [dev-dependencies]
 indicatif = { version = "0.18", features = ["in_memory"] }
