@@ -119,6 +119,7 @@ pub struct AgentServiceOptions {
     pub arguments: Vec<String>,
     pub restart_delay: Duration,
     pub network_required: bool,
+    pub state_directory_mode: u32,
     pub hardening: ServiceHardening,
 }
 
@@ -425,7 +426,7 @@ impl ManagedProduct {
              RuntimeDirectoryMode=0755\n\
              RuntimeDirectoryPreserve=yes\n\
              StateDirectory={} capulus\n\
-             StateDirectoryMode=0700\n\
+             StateDirectoryMode={:04o}\n\
              {hardening}\
              \n\
              [Install]\n\
@@ -436,6 +437,7 @@ impl ManagedProduct {
             self.service.restart_delay.as_secs(),
             self.product,
             self.product,
+            self.service.state_directory_mode,
         )
     }
 
@@ -616,6 +618,8 @@ pub enum ProductValidationError {
     UnsafeServiceText,
     #[error("agent restart delay must be between one second and one hour")]
     RestartDelay,
+    #[error("agent state-directory mode must grant owner rwx and no permissions outside 0777")]
+    StateDirectoryMode,
     #[error("managed path must be absolute, normalized, and contain no parent traversal: {0}")]
     UnsafePath(PathBuf),
     #[error("strict hardening path does not exist beneath an allowed system root: {0}")]
@@ -691,6 +695,9 @@ fn validate_service(
     }
     if !(Duration::from_secs(1)..=Duration::from_secs(60 * 60)).contains(&service.restart_delay) {
         return Err(ProductValidationError::RestartDelay);
+    }
+    if service.state_directory_mode > 0o777 || service.state_directory_mode & 0o700 != 0o700 {
+        return Err(ProductValidationError::StateDirectoryMode);
     }
     if let ServiceHardening::Strict {
         read_write_paths,
@@ -823,6 +830,7 @@ mod tests {
                 arguments: vec!["serve".to_string()],
                 restart_delay: Duration::from_secs(5),
                 network_required: false,
+                state_directory_mode: 0o700,
                 hardening: ServiceHardening::Strict {
                     read_write_paths: vec![PathBuf::from("/var/lib/auc")],
                     device_allow: vec![PathBuf::from("/dev/uhid")],
@@ -866,6 +874,7 @@ mod tests {
         assert!(text.contains("RuntimeDirectory=auc capulus"));
         assert!(text.contains("RuntimeDirectoryPreserve=yes"));
         assert!(text.contains("StateDirectory=auc capulus"));
+        assert!(text.contains("StateDirectoryMode=0700"));
         assert!(text.contains("DeviceAllow=\"/dev/uhid\" rw"));
     }
 
@@ -923,5 +932,12 @@ mod tests {
         let mut mismatch = options();
         mismatch.system_binaries[0].destination = PathBuf::from("/usr/local/bin/not-auc");
         assert!(mismatch.validate().is_err());
+
+        let mut unsafe_state_mode = options();
+        unsafe_state_mode.service.state_directory_mode = 0o1700;
+        assert!(matches!(
+            unsafe_state_mode.validate(),
+            Err(ProductValidationError::StateDirectoryMode)
+        ));
     }
 }

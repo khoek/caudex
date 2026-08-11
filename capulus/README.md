@@ -20,9 +20,12 @@ staged migration from an already-deployed self-binding agent: systemd owns only 
 later release atomically installs and adopts the application socket unit.
 
 `ManagedProductOptions::validate` fixes every privileged package name, executable, destination,
-service argument, unit name, socket path, and hardening policy before side effects. A product then
-uses `ManagedAgent` as its management handler and `RedeployWorker` for the one-shot worker command.
-Only the `ReleaseSource` boundary is product-specific.
+service argument, state-root mode, unit name, socket path, and hardening policy before side effects.
+A private product state root normally uses mode 0700. A product that intentionally exposes a
+read-only artifact beneath its state root may declare a more permissive mode such as 0755 while
+keeping secret-bearing descendants private. A product then uses `ManagedAgent` as its management
+handler and `RedeployWorker` for the one-shot worker command. Only the `ReleaseSource` boundary is
+product-specific.
 
 ### Protocol v1
 

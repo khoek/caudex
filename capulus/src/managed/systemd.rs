@@ -415,6 +415,7 @@ mod tests {
                 arguments: vec!["serve".to_string()],
                 restart_delay: Duration::from_secs(5),
                 network_required: false,
+                state_directory_mode: 0o700,
                 hardening: ServiceHardening::Strict {
                     read_write_paths: vec![PathBuf::from("/var/lib/auc")],
                     device_allow: vec![PathBuf::from("/dev/uhid")],
