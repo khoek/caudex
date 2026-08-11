@@ -183,15 +183,15 @@ impl BuildAccount {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DirectoryOwner {
-    uid: u32,
-    gid: u32,
+pub(super) struct DirectoryOwner {
+    pub(super) uid: u32,
+    pub(super) gid: u32,
 }
 
 impl DirectoryOwner {
-    const ROOT: Self = Self { uid: 0, gid: 0 };
+    pub(super) const ROOT: Self = Self { uid: 0, gid: 0 };
 
-    fn of(account: &UnixAccount) -> Self {
+    pub(super) fn of(account: &UnixAccount) -> Self {
         Self {
             uid: account.uid,
             gid: account.gid,
@@ -455,6 +455,39 @@ impl BuildAccount {
         self.cargo_tools_home.join("bin/rustup")
     }
 
+    pub(super) fn reclaim_target_home(&self) -> Result<()> {
+        require_root()?;
+        self.reclaim_target_home_with(DirectoryOwner::ROOT)
+    }
+
+    fn reclaim_target_home_with(&self, boundary_owner: DirectoryOwner) -> Result<()> {
+        let home_path = self.home()?;
+        let home = open_real_directory(home_path)?;
+        if !DirectoryIdentity::from_metadata(&home.metadata()?)
+            .is_owned_directory(boundary_owner, 0o711)
+        {
+            bail!("Capulus cannot reclaim a target outside its current build-home boundary");
+        }
+        let target = open_directory_at(&home, OsStr::new("target"))?;
+        if !DirectoryIdentity::from_metadata(&target.metadata()?)
+            .is_owned_directory(DirectoryOwner::of(&self.account), 0o700)
+        {
+            bail!("Capulus build target ownership or mode changed before reclamation");
+        }
+        fs::remove_dir_all(&self.target_home)
+            .context("failed to reclaim the shared build target")?;
+        home.sync_all()?;
+        self.ensure_private_directory(&self.target_home, boundary_owner)?;
+        home.sync_all()?;
+        let target = open_directory_at(&home, OsStr::new("target"))?;
+        if !DirectoryIdentity::from_metadata(&target.metadata()?)
+            .is_owned_directory(DirectoryOwner::of(&self.account), 0o700)
+        {
+            bail!("Capulus did not recreate its shared build target securely");
+        }
+        Ok(())
+    }
+
     pub(super) fn command(&self, program: impl AsRef<OsStr>, cargo_home: &Path) -> Command {
         let mut path = self.cargo_tools_home.join("bin").into_os_string();
         path.push(":");
@@ -498,7 +531,7 @@ impl BuildAccount {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DirectoryIdentity {
+pub(super) struct DirectoryIdentity {
     is_directory: bool,
     uid: u32,
     gid: u32,
@@ -506,7 +539,7 @@ struct DirectoryIdentity {
 }
 
 impl DirectoryIdentity {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    pub(super) fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             is_directory: metadata.file_type().is_dir(),
             uid: metadata.uid(),
@@ -515,16 +548,28 @@ impl DirectoryIdentity {
         }
     }
 
-    fn is_owned_directory(self, owner: DirectoryOwner, mode: u32) -> bool {
-        self.is_directory && self.uid == owner.uid && self.gid == owner.gid && self.mode == mode
+    pub(super) fn is_owned_directory(self, owner: DirectoryOwner, mode: u32) -> bool {
+        self.is_directory_with_mode(mode) && self.uid == owner.uid && self.gid == owner.gid
+    }
+
+    pub(super) fn is_directory_with_mode(self, mode: u32) -> bool {
+        self.is_directory && self.mode == mode
+    }
+
+    pub(super) fn is_directory_owned_by_other_uid(self, owner: DirectoryOwner, mode: u32) -> bool {
+        self.is_directory_with_mode(mode) && self.uid != owner.uid
     }
 
     fn is_restricted_creation(self, owner: DirectoryOwner) -> bool {
+        self.is_restricted(owner, 0o700)
+    }
+
+    pub(super) fn is_restricted(self, owner: DirectoryOwner, mode: u32) -> bool {
         self.is_directory
             && self.uid == owner.uid
             && self.gid == owner.gid
-            && self.mode != 0o700
-            && self.mode & !0o700 == 0
+            && self.mode != mode
+            && self.mode & !mode == 0
     }
 }
 
@@ -795,7 +840,7 @@ fn open_or_create_restricted_directory_with(
     Ok((directory, created))
 }
 
-fn open_directory_at(parent: &File, name: &OsStr) -> Result<File> {
+pub(super) fn open_directory_at(parent: &File, name: &OsStr) -> Result<File> {
     openat(
         parent,
         name,
@@ -806,7 +851,18 @@ fn open_directory_at(parent: &File, name: &OsStr) -> Result<File> {
     .map_err(|error| std::io::Error::from(error).into())
 }
 
-fn require_empty_directory(directory: &File, path: &Path) -> Result<()> {
+pub(super) fn open_file_at(parent: &File, name: &OsStr) -> Result<File> {
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| std::io::Error::from(error).into())
+}
+
+pub(super) fn require_empty_directory(directory: &File, path: &Path) -> Result<()> {
     let mut buffer = [MaybeUninit::uninit(); 4096];
     let mut entries = RawDir::new(directory, &mut buffer);
     while let Some(entry) = entries.next() {
@@ -821,7 +877,7 @@ fn require_empty_directory(directory: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_real_directory(path: &Path) -> Result<File> {
+pub(super) fn open_real_directory(path: &Path) -> Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -829,7 +885,7 @@ fn open_real_directory(path: &Path) -> Result<File> {
         .map_err(Into::into)
 }
 
-fn set_directory_owner_and_sync(
+pub(super) fn set_directory_owner_and_sync(
     directory: &File,
     owner: DirectoryOwner,
     context: &str,
@@ -844,7 +900,11 @@ fn set_directory_owner_and_sync(
     directory.sync_all().map_err(Into::into)
 }
 
-fn set_directory_mode_and_sync(directory: &File, mode: u32, context: &str) -> Result<()> {
+pub(super) fn set_directory_mode_and_sync(
+    directory: &File,
+    mode: u32,
+    context: &str,
+) -> Result<()> {
     fchmod(directory, Mode::from_raw_mode(mode))
         .map_err(std::io::Error::from)
         .with_context(|| context.to_owned())?;
@@ -1317,7 +1377,7 @@ mod tests {
         assert_current_layout(&build);
 
         let build = test_build(temporary.path().join("jobs-creation-interrupted"));
-        create_layout(&build, 0o711, 0o700);
+        create_layout(&build, 0o711, 0o500);
         set_test_owner(&build.jobs_home, build.boundary_owner);
         build.ensure_layout().unwrap();
         assert_current_layout(&build);
@@ -1329,7 +1389,7 @@ mod tests {
         let build = test_build(temporary.path().join("capulus-build"));
         create_test_directory(&build.home, 0o700);
         set_test_owner(&build.home, build.boundary_owner);
-        create_test_directory(&build.cache_home, 0o700);
+        create_test_directory(&build.cache_home, 0o500);
         set_test_owner(&build.cache_home, build.boundary_owner);
         let inode = fs::symlink_metadata(&build.cache_home).unwrap().ino();
 
@@ -1351,18 +1411,9 @@ mod tests {
         create_test_directory(&build.cache_home, 0o700);
         set_test_owner(&build.cache_home, build.boundary_owner);
         fs::write(build.cache_home.join("unexpected"), b"data").unwrap();
+        fs::set_permissions(&build.cache_home, fs::Permissions::from_mode(0o500)).unwrap();
 
-        if build.boundary_owner == DirectoryOwner::of(&build.account) {
-            assert!(
-                require_empty_directory(
-                    &open_real_directory(&build.cache_home).unwrap(),
-                    &build.cache_home,
-                )
-                .is_err()
-            );
-        } else {
-            assert!(build.ensure_private_directory(&build.cache_home).is_err());
-        }
+        assert!(build.ensure_private_directory(&build.cache_home).is_err());
     }
 
     #[test]
@@ -1475,6 +1526,50 @@ mod tests {
         assert_mode(&build.jobs_home, 0o755);
     }
 
+    #[test]
+    fn target_reclamation_preserves_caches_and_recreates_an_exact_empty_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = test_build(temporary.path().join("capulus-build"));
+        create_layout(&build, 0o711, 0o711);
+        fs::create_dir(build.target_home.join("debug")).unwrap();
+        fs::write(build.target_home.join("debug/artifact"), b"large target").unwrap();
+        fs::write(build.cache_home.join("registry-index"), b"preserve cache").unwrap();
+        let old_target = open_real_directory(&build.target_home).unwrap();
+        let old_inode = old_target.metadata().unwrap().ino();
+
+        build
+            .build
+            .reclaim_target_home_with(build.boundary_owner)
+            .unwrap();
+
+        assert_owned_mode(
+            &build.target_home,
+            DirectoryOwner::of(&build.account),
+            0o700,
+        );
+        assert_ne!(
+            fs::symlink_metadata(&build.target_home).unwrap().ino(),
+            old_inode
+        );
+        assert!(fs::read_dir(&build.target_home).unwrap().next().is_none());
+        assert_eq!(
+            fs::read(build.cache_home.join("registry-index")).unwrap(),
+            b"preserve cache"
+        );
+
+        fs::remove_dir(&build.target_home).unwrap();
+        open_real_directory(&build.home)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        build.ensure_layout().unwrap();
+        assert_owned_mode(
+            &build.target_home,
+            DirectoryOwner::of(&build.account),
+            0o700,
+        );
+    }
+
     fn classify_test_boundary(
         uid: u32,
         gid: u32,
@@ -1520,15 +1615,7 @@ mod tests {
 
     fn test_build(home: PathBuf) -> TestBuild {
         let account = UnixAccount::by_uid(rustix::process::geteuid().as_raw()).unwrap();
-        let boundary_owner = DirectoryOwner {
-            uid: account.uid,
-            gid: rustix::process::getgroups()
-                .unwrap()
-                .into_iter()
-                .map(|gid| gid.as_raw())
-                .find(|gid| *gid != account.gid)
-                .unwrap_or(account.gid),
-        };
+        let boundary_owner = DirectoryOwner::of(&account);
         let build = BuildAccount {
             account,
             cargo_tools_home: home.join("cargo-tools"),

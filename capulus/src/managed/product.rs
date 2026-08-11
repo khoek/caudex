@@ -467,7 +467,7 @@ impl ManagedProduct {
              Restart=always\n\
              RestartSec={}s\n\
              RuntimeDirectory={} capulus\n\
-             RuntimeDirectoryMode=0755\n\
+             RuntimeDirectoryMode=0711\n\
              RuntimeDirectoryPreserve=yes\n\
              StateDirectory={}\n\
              StateDirectoryMode={:04o}\n\
@@ -940,6 +940,8 @@ mod tests {
         assert!(text.contains("Requires=auc-agent.socket auc-capulus.socket"));
         assert!(text.contains("ProtectHome=read-only"));
         assert!(text.contains("RuntimeDirectory=auc capulus"));
+        assert!(text.contains("RuntimeDirectoryMode=0711"));
+        assert!(!text.contains("RuntimeDirectoryMode=0755"));
         assert!(text.contains("RuntimeDirectoryPreserve=yes"));
         assert!(text.contains("StateDirectory=auc\n"));
         assert!(text.contains("ReadWritePaths=\"/var/lib/auc\" \"/var/lib/capulus\""));

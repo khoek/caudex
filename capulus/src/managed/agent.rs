@@ -24,8 +24,10 @@ pub struct ManagedAgent<S> {
 
 impl<S> ManagedAgent<S> {
     pub fn new(product: Arc<ManagedProduct>, releases: Arc<S>) -> Result<Self> {
+        let coordinator = RedeployCoordinator::new(Arc::clone(&product))?;
+        coordinator.start_startup_reconciler()?;
         Ok(Self {
-            coordinator: RedeployCoordinator::new(Arc::clone(&product))?,
+            coordinator,
             product,
             releases,
         })

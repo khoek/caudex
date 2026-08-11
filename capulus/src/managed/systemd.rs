@@ -68,6 +68,10 @@ impl SystemdManager {
             ("After", Value::from(network_online)),
             ("CollectMode", Value::from("inactive-or-failed")),
         ];
+        let properties = properties
+            .into_iter()
+            .chain(redeploy_runtime_properties(product, job))
+            .collect::<Vec<_>>();
         manager
             .start_transient_unit(&unit, Mode::Fail, &properties, &[])
             .await
@@ -327,6 +331,23 @@ impl SystemdManager {
             .await
             .map_err(|source| operation("reload systemd after managed file removal", source))
     }
+}
+
+fn redeploy_runtime_directory(product: &ManagedProduct, job: JobId) -> String {
+    format!("capulus/user-installs/{}-{job}", product.name())
+}
+
+fn redeploy_runtime_properties(
+    product: &ManagedProduct,
+    job: JobId,
+) -> [(&'static str, Value<'static>); 2] {
+    [
+        (
+            "RuntimeDirectory",
+            Value::from(vec![redeploy_runtime_directory(product, job)]),
+        ),
+        ("RuntimeDirectoryMode", Value::from(0o711_u32)),
+    ]
 }
 
 fn managed_unit_names(product: &ManagedProduct) -> [String; 3] {
@@ -592,6 +613,21 @@ mod tests {
         assert_eq!(
             SystemdManager::redeploy_unit_name(&product(), job),
             "auc-redeploy-deadbeefdeadbeefdeadbeefdeadbeef.service"
+        );
+        assert_eq!(
+            redeploy_runtime_directory(&product(), job),
+            "capulus/user-installs/auc-deadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        let properties = redeploy_runtime_properties(&product(), job);
+        assert_eq!(properties[0].0, "RuntimeDirectory");
+        assert_eq!(
+            Vec::<String>::try_from(properties[0].1.try_clone().unwrap()).unwrap(),
+            ["capulus/user-installs/auc-deadbeefdeadbeefdeadbeefdeadbeef"]
+        );
+        assert_eq!(properties[1].0, "RuntimeDirectoryMode");
+        assert_eq!(
+            u32::try_from(properties[1].1.try_clone().unwrap()).unwrap(),
+            0o711
         );
     }
 

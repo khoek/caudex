@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::account::require_root;
+use super::account::{ensure_root_directory, require_root};
 use super::build::run_with_deadline;
 use super::{
     BuildArtifacts, JobId, ManagedFile, ManagedProduct, RepairOutcome, SystemdManager, UnixAccount,
@@ -1196,25 +1196,6 @@ fn hex_digest(bytes: &[u8]) -> String {
         })
 }
 
-fn ensure_root_directory(path: &Path, mode: u32) -> Result<()> {
-    validate_normal_absolute(path)?;
-    let mut current = PathBuf::from("/");
-    for component in path.components().skip(1) {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => validate_directory_metadata(&current, &metadata)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)
-                    .with_context(|| format!("failed to create {}", current.display()))?;
-                validate_root_directory(&current)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
 fn validate_root_directory(path: &Path) -> Result<()> {
     validate_directory_metadata(path, &fs::symlink_metadata(path)?)
 }
@@ -1267,6 +1248,7 @@ fn managed_destination(managed: &ManagedFile) -> &Path {
 }
 
 fn acquire_installation_lock(product: &ManagedProduct) -> Result<crate::InvocationLock> {
+    ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
     ensure_root_directory(Path::new(INSTALLATION_LOCK_ROOT), 0o700)?;
     crate::acquire_named_in(
         INSTALLATION_LOCK_ROOT,

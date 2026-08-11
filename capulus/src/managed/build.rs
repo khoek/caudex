@@ -11,8 +11,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use rustix::process::{Pid, Signal, kill_process_group};
 use sha2::{Digest, Sha256};
 
-use super::account::{SupplementaryGroups, ensure_owned_directory, require_root};
-use super::user_install::remove_orphaned_user_installations;
+use super::account::{
+    SupplementaryGroups, ensure_owned_directory, ensure_root_directory, require_root,
+};
+use super::user_install::remove_orphaned_user_installations_for_job;
 use super::{BuildAccount, InstallationManifest, ManagedProduct, RedeployRequest, UnixAccount};
 
 const GLOBAL_BUILD_LOCK_ROOT: &str = "/run/capulus/locks";
@@ -34,16 +36,10 @@ pub struct ManagedBuild {
 impl ManagedBuild {
     pub fn prepare(request: RedeployRequest) -> Result<Self> {
         require_root()?;
-        fs::create_dir_all(GLOBAL_BUILD_LOCK_ROOT)
-            .context("failed to create global Capulus build lock directory")?;
-        fs::set_permissions(GLOBAL_BUILD_LOCK_ROOT, fs::Permissions::from_mode(0o700))
-            .context("failed to secure global Capulus build lock directory")?;
-        let global_lock =
-            crate::acquire_named_in(GLOBAL_BUILD_LOCK_ROOT, GLOBAL_BUILD_LOCK_NAME, true)
-                .context("failed to acquire global Capulus build lock")?;
+        let global_lock = acquire_managed_build_lock()?;
         let account = BuildAccount::ensure()?;
         account.remove_orphaned_jobs()?;
-        remove_orphaned_user_installations()?;
+        remove_orphaned_user_installations_for_job(&request.product, request.job)?;
         let job_root = account
             .jobs_home
             .join(format!("{}-{}", request.product, request.job));
@@ -136,6 +132,10 @@ impl ManagedBuild {
 
     pub fn account(&self) -> &BuildAccount {
         &self.account
+    }
+
+    pub(super) fn reclaim_target_for_user_install(&self) -> Result<()> {
+        self.account.reclaim_target_home()
     }
 
     fn validate_binary_versions(
@@ -309,6 +309,23 @@ impl ManagedBuild {
         let mut command = self.account.command(program, cargo_home);
         command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         command
+    }
+}
+
+pub(super) fn acquire_managed_build_lock() -> Result<crate::InvocationLock> {
+    ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
+    ensure_root_directory(Path::new(GLOBAL_BUILD_LOCK_ROOT), 0o700)?;
+    crate::acquire_named_in(GLOBAL_BUILD_LOCK_ROOT, GLOBAL_BUILD_LOCK_NAME, true)
+        .context("failed to acquire global Capulus build lock")
+}
+
+pub(super) fn try_acquire_managed_build_lock() -> Result<Option<crate::InvocationLock>> {
+    ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
+    ensure_root_directory(Path::new(GLOBAL_BUILD_LOCK_ROOT), 0o700)?;
+    match crate::acquire_named_in(GLOBAL_BUILD_LOCK_ROOT, GLOBAL_BUILD_LOCK_NAME, false) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(crate::LockError::AlreadyRunning { .. }) => Ok(None),
+        Err(error) => Err(error).context("failed to acquire global Capulus cleanup lock"),
     }
 }
 

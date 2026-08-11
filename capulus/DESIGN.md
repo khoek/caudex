@@ -115,6 +115,30 @@ primary GID, supplementary groups, home, Cargo home, and Rustup home. Cargo inst
 binary at the exact committed version. capulus never creates a user installation where none
 existed and never replaces Cargo metadata with a symlink or dispatcher.
 
+After the system artifacts have been copied out and verified, a job that requires a user reinstall
+durably clears and recreates the shared system-build target while it still holds the global build
+lock. The shared registry and Git caches remain intact. This serializes the two large Cargo targets
+instead of retaining both through the system commit.
+
+Before the system commit, capulus prepares a fresh per-job Cargo home and target directory under
+`/var/lib/capulus-user-installs`. Both user-install roots and every direct job boundary are
+root-owned mode 0711. Only the fixed persistent `cargo` and `target` children are owned by the
+requesting user's exact UID and primary GID at mode 0700. capulus rejects a noexec backing
+filesystem before committing the system installation. Registry configuration, credentials, and
+custom CA material are user-owned mode-0600 files under `/run/capulus/user-installs`, created only
+immediately before Cargo runs beneath a root-owned job boundary. The persistent Cargo home reaches
+the volatile Cargo files through anchored symlinks; the CA path refers directly to the volatile
+file, and no credential or CA bytes are stored beneath `/var/lib`.
+
+Each transient worker declares its exact volatile job boundary as a nested systemd
+`RuntimeDirectory` at mode 0711, so systemd removes it when the unit stops even after abnormal
+termination. capulus also scrubs that boundary as soon as Cargo returns, runs version verification
+even if scrubbing reports an error, and removes volatile state before persistent build state on
+every normal return. Startup and inactive-job recovery validate both roots before deletion and fail
+closed on unexpected names, links, ownership, or modes. The coordinator clears a terminal active
+record synchronously; a nonterminal active job is monitored through systemd without acquiring the
+global build lock while its worker remains live.
+
 ## Redeploy state and liveness
 
 Secret-bearing requests live under `/run/capulus/jobs/<product>`. Sanitized status and root-only
@@ -129,7 +153,8 @@ Different-boot active state is failed during store initialization.
 
 Transient workers have a finite runtime covering toolchain work, both possible Cargo builds, system
 activation, health checks, and cleanup. Their systemd cgroup has explicit task, CPU, I/O, memory,
-kill, OOM, logging, and network-ordering policy.
+kill, OOM, logging, and network-ordering policy. The nested volatile user-install directory is tied
+to that transient unit's lifetime.
 
 ## Recoverable installation
 
@@ -168,11 +193,12 @@ interruption before that boundary restores files and prior enablement.
 
 ```text
 /var/lib/capulus-build/                  shared unprivileged Rust build home
+/var/lib/capulus-user-installs/          executable requesting-user Cargo workspaces
 /var/lib/capulus/jobs/<product>/         durable job status and diagnostics
 /var/lib/capulus/installations/<product>/ installation and uninstall journals
 /run/capulus/jobs/<product>/             ephemeral secret redeploy requests
 /run/capulus/locks/                      build, scheduling, and installation locks
-/run/capulus/user-installs/              ephemeral requesting-user Cargo configuration
+/run/capulus/user-installs/              volatile registry configuration and credentials
 /run/<product>/agent.sock                product application protocol
 /run/<product>/capulus.sock              capulus management protocol
 ```
