@@ -461,7 +461,7 @@ impl ManagedProduct {
              [Install]\n\
              WantedBy=sockets.target\n",
             self.product,
-            quote_systemd_path(&options.path),
+            options.path.display(),
             self.service_name(),
             options.mode,
         )
@@ -858,6 +858,8 @@ mod tests {
 
         assert!(text.contains("FileDescriptorName=application"));
         assert!(text.contains("FileDescriptorName=capulus"));
+        assert!(text.contains("ListenStream=/run/auc/agent.sock"));
+        assert!(!text.contains("ListenStream=\""));
         assert!(text.contains("Requires=auc-agent.socket auc-capulus.socket"));
         assert!(text.contains("DeviceAllow=\"/dev/uhid\" rw"));
     }
