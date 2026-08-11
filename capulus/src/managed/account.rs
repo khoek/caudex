@@ -1,13 +1,16 @@
 use std::ffi::{CStr, CString, OsStr};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::fs::{Gid, Mode, Uid, fchmod, fchown};
+use rustix::fs::{
+    AtFlags, Gid, Mode, OFlags, RawDir, Uid, chmodat, fchmod, fchown, mkdirat, openat,
+};
 use serde::{Deserialize, Serialize};
 
 use super::product::is_valid_identifier;
@@ -149,6 +152,54 @@ pub struct BuildAccount {
 }
 
 impl BuildAccount {
+    fn home(&self) -> Result<&Path> {
+        let home = self
+            .cargo_tools_home
+            .parent()
+            .ok_or_else(|| anyhow!("Capulus cargo-tools directory has no parent"))?;
+        validate_absolute_normal_path(home)?;
+        for (path, name) in [
+            (&self.cargo_tools_home, "cargo-tools"),
+            (&self.rustup_home, "rustup"),
+            (&self.cache_home, "cache"),
+            (&self.target_home, "target"),
+            (&self.jobs_home, "jobs"),
+        ] {
+            if path.parent() != Some(home) || path.file_name() != Some(OsStr::new(name)) {
+                bail!("Capulus build paths do not share the canonical home layout");
+            }
+        }
+        Ok(home)
+    }
+
+    fn private_directories(&self) -> [&Path; 4] {
+        [
+            &self.cargo_tools_home,
+            &self.rustup_home,
+            &self.cache_home,
+            &self.target_home,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryOwner {
+    uid: u32,
+    gid: u32,
+}
+
+impl DirectoryOwner {
+    const ROOT: Self = Self { uid: 0, gid: 0 };
+
+    fn of(account: &UnixAccount) -> Self {
+        Self {
+            uid: account.uid,
+            gid: account.gid,
+        }
+    }
+}
+
+impl BuildAccount {
     pub fn ensure() -> Result<Self> {
         require_root()?;
         if UnixAccount::by_name(BUILD_USER)?.is_none() {
@@ -187,17 +238,213 @@ impl BuildAccount {
             target_home: PathBuf::from(BUILD_TARGET_HOME),
             jobs_home: PathBuf::from(BUILD_JOBS_HOME),
         };
-        ensure_root_directory(Path::new(BUILD_HOME), 0o711)?;
-        for path in [
-            &build.cargo_tools_home,
-            &build.rustup_home,
-            &build.cache_home,
-            &build.target_home,
-        ] {
-            ensure_owned_directory(path, &build.account, 0o700)?;
-        }
-        ensure_root_directory(&build.jobs_home, 0o711)?;
+        build.ensure_layout_with(DirectoryOwner::ROOT)?;
         Ok(build)
+    }
+
+    fn ensure_layout_with(&self, boundary_owner: DirectoryOwner) -> Result<()> {
+        let home_path = self.home()?;
+        let (home, state) = self.ensure_home_boundary(home_path, boundary_owner)?;
+        self.validate_home_entries(home_path, state, boundary_owner)?;
+        for path in self.private_directories() {
+            self.ensure_private_directory(path, boundary_owner)?;
+        }
+        self.ensure_jobs_directory(state, boundary_owner)?;
+        home.sync_all()?;
+        if state == BoundaryState::OwnershipSecured {
+            set_directory_mode_and_sync(
+                &home,
+                0o711,
+                "failed to finish the Capulus build-home migration",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_home_boundary(
+        &self,
+        path: &Path,
+        boundary_owner: DirectoryOwner,
+    ) -> Result<(File, BoundaryState)> {
+        let (directory, initializing) =
+            open_or_create_restricted_directory(path, boundary_owner)
+                .context("failed to open or create the Capulus build home")?;
+        let state = if initializing {
+            set_directory_owner_and_sync(
+                &directory,
+                boundary_owner,
+                "failed to secure ownership of the Capulus build home",
+            )?;
+            open_real_directory(
+                path.parent()
+                    .expect("the build home has a validated parent"),
+            )?
+            .sync_all()?;
+            BoundaryState::OwnershipSecured
+        } else {
+            match BoundaryState::classify(
+                DirectoryIdentity::from_metadata(&directory.metadata()?),
+                DirectoryOwner::of(&self.account),
+                boundary_owner,
+            )? {
+                BoundaryState::PriorLayout => {
+                    set_directory_owner_and_sync(
+                        &directory,
+                        boundary_owner,
+                        "failed to secure ownership of the Capulus build home",
+                    )?;
+                    BoundaryState::OwnershipSecured
+                }
+                state => state,
+            }
+        };
+        Ok((directory, state))
+    }
+
+    fn validate_home_entries(
+        &self,
+        home: &Path,
+        home_state: BoundaryState,
+        boundary_owner: DirectoryOwner,
+    ) -> Result<()> {
+        for entry in fs::read_dir(home).context("failed to inspect the Capulus build home")? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let identity = DirectoryIdentity::from_metadata(&fs::symlink_metadata(entry.path())?);
+            if self
+                .private_directories()
+                .iter()
+                .any(|path| path.file_name() == Some(name.as_os_str()))
+            {
+                match PrivateDirectoryState::classify(
+                    identity,
+                    DirectoryOwner::of(&self.account),
+                    boundary_owner,
+                )
+                .with_context(|| {
+                    format!(
+                        "Capulus private build directory has invalid type, ownership, or mode: {}",
+                        entry.path().display()
+                    )
+                })? {
+                    PrivateDirectoryState::Current => {}
+                    PrivateDirectoryState::CreationInterrupted => {
+                        require_empty_directory(
+                            &open_real_directory(&entry.path())?,
+                            &entry.path(),
+                        )?;
+                    }
+                }
+            } else if self.jobs_home.file_name() == Some(name.as_os_str()) {
+                let creation_restricted = identity.is_restricted_creation(boundary_owner);
+                let jobs_state = if creation_restricted {
+                    BoundaryState::OwnershipSecured
+                } else {
+                    BoundaryState::classify(
+                        identity,
+                        DirectoryOwner::of(&self.account),
+                        boundary_owner,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Capulus build jobs directory has invalid type, ownership, or mode: {}",
+                            entry.path().display()
+                        )
+                    })?
+                };
+                if home_state == BoundaryState::Current && jobs_state == BoundaryState::PriorLayout
+                {
+                    bail!(
+                        "Capulus current build home contains a prior-layout jobs directory: {}",
+                        entry.path().display()
+                    );
+                }
+                if creation_restricted
+                    || (home_state == BoundaryState::Current
+                        && jobs_state == BoundaryState::OwnershipSecured)
+                {
+                    require_empty_directory(&open_real_directory(&entry.path())?, &entry.path())?;
+                }
+            } else {
+                bail!(
+                    "Capulus build home contains an unexpected top-level entry: {:?}",
+                    name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_private_directory(&self, path: &Path, boundary_owner: DirectoryOwner) -> Result<()> {
+        let (directory, initializing) =
+            open_or_create_restricted_directory(path, boundary_owner)
+                .with_context(|| format!("failed to open or create {}", path.display()))?;
+        let state = if initializing {
+            PrivateDirectoryState::CreationInterrupted
+        } else {
+            PrivateDirectoryState::classify(
+                DirectoryIdentity::from_metadata(&directory.metadata()?),
+                DirectoryOwner::of(&self.account),
+                boundary_owner,
+            )?
+        };
+        match state {
+            PrivateDirectoryState::Current => Ok(()),
+            PrivateDirectoryState::CreationInterrupted => {
+                require_empty_directory(&directory, path)?;
+                set_directory_owner_and_sync(
+                    &directory,
+                    DirectoryOwner::of(&self.account),
+                    &format!("failed to finish creating {}", path.display()),
+                )
+            }
+        }
+    }
+
+    fn ensure_jobs_directory(
+        &self,
+        home_state: BoundaryState,
+        boundary_owner: DirectoryOwner,
+    ) -> Result<()> {
+        let (directory, initializing) =
+            open_or_create_restricted_directory(&self.jobs_home, boundary_owner)
+                .context("failed to open or create the Capulus build jobs directory")?;
+        let mut state = if initializing {
+            set_directory_owner_and_sync(
+                &directory,
+                boundary_owner,
+                "failed to secure ownership of the Capulus build jobs directory",
+            )?;
+            BoundaryState::OwnershipSecured
+        } else {
+            BoundaryState::classify(
+                DirectoryIdentity::from_metadata(&directory.metadata()?),
+                DirectoryOwner::of(&self.account),
+                boundary_owner,
+            )?
+        };
+        if home_state == BoundaryState::Current && state == BoundaryState::PriorLayout {
+            bail!("Capulus current build home contains a prior-layout jobs directory");
+        }
+        if home_state == BoundaryState::Current && state == BoundaryState::OwnershipSecured {
+            require_empty_directory(&directory, &self.jobs_home)?;
+        }
+        if state == BoundaryState::PriorLayout {
+            set_directory_owner_and_sync(
+                &directory,
+                boundary_owner,
+                "failed to secure ownership of the Capulus build jobs directory",
+            )?;
+            state = BoundaryState::OwnershipSecured;
+        }
+        if state == BoundaryState::OwnershipSecured {
+            set_directory_mode_and_sync(
+                &directory,
+                0o711,
+                "failed to finish the Capulus build-jobs migration",
+            )?;
+        }
+        Ok(())
     }
 
     pub fn cargo(&self) -> PathBuf {
@@ -247,6 +494,88 @@ impl BuildAccount {
                 .with_context(|| format!("failed to remove orphaned Capulus build job {name}"))?;
         }
         File::open(&self.jobs_home)?.sync_all().map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    is_directory: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            is_directory: metadata.file_type().is_dir(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: metadata.permissions().mode() & 0o7777,
+        }
+    }
+
+    fn is_owned_directory(self, owner: DirectoryOwner, mode: u32) -> bool {
+        self.is_directory && self.uid == owner.uid && self.gid == owner.gid && self.mode == mode
+    }
+
+    fn is_restricted_creation(self, owner: DirectoryOwner) -> bool {
+        self.is_directory
+            && self.uid == owner.uid
+            && self.gid == owner.gid
+            && self.mode != 0o700
+            && self.mode & !0o700 == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryState {
+    Current,
+    PriorLayout,
+    OwnershipSecured,
+}
+
+impl BoundaryState {
+    fn classify(
+        identity: DirectoryIdentity,
+        prior_owner: DirectoryOwner,
+        current_owner: DirectoryOwner,
+    ) -> Result<Self> {
+        if identity.is_owned_directory(current_owner, 0o711) {
+            Ok(Self::Current)
+        } else if identity.is_owned_directory(prior_owner, 0o700) {
+            Ok(Self::PriorLayout)
+        } else if identity.is_owned_directory(current_owner, 0o700) {
+            Ok(Self::OwnershipSecured)
+        } else {
+            bail!(
+                "Capulus build boundary is neither current, an exact prior layout, nor an interrupted migration"
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateDirectoryState {
+    Current,
+    CreationInterrupted,
+}
+
+impl PrivateDirectoryState {
+    fn classify(
+        identity: DirectoryIdentity,
+        current_owner: DirectoryOwner,
+        boundary_owner: DirectoryOwner,
+    ) -> Result<Self> {
+        if identity.is_owned_directory(current_owner, 0o700) {
+            Ok(Self::Current)
+        } else if identity.is_owned_directory(boundary_owner, 0o700)
+            || identity.is_restricted_creation(boundary_owner)
+        {
+            Ok(Self::CreationInterrupted)
+        } else {
+            bail!("Capulus private build directory is neither current nor an interrupted creation")
+        }
     }
 }
 
@@ -374,18 +703,18 @@ pub(super) fn ensure_owned_directory(path: &Path, account: &UnixAccount, mode: u
         }
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
+            let mut builder = DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(path)
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
         }
     }
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    let directory =
+        open_real_directory(path).with_context(|| format!("failed to open {}", path.display()))?;
     fchown(
         &directory,
         Some(Uid::from_raw(account.uid)),
@@ -395,28 +724,130 @@ pub(super) fn ensure_owned_directory(path: &Path, account: &UnixAccount, mode: u
     .with_context(|| format!("failed to chown {}", path.display()))?;
     fchmod(&directory, Mode::from_raw_mode(mode))
         .map_err(std::io::Error::from)
-        .with_context(|| format!("failed to chmod {}", path.display()))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    directory.sync_all().map_err(Into::into)
 }
 
 pub(super) fn ensure_root_directory(path: &Path, mode: u32) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata)
-            if !metadata.file_type().is_dir() || metadata.uid() != 0 || metadata.gid() != 0 =>
-        {
-            bail!(
-                "Capulus path is not a root-owned real directory: {}",
-                path.display()
-            )
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(path)?,
-        Err(error) => return Err(error.into()),
+    let (directory, initializing) =
+        open_or_create_restricted_directory(path, DirectoryOwner::ROOT)?;
+    let identity = DirectoryIdentity::from_metadata(&directory.metadata()?);
+    if !identity.is_directory || identity.uid != 0 || identity.gid != 0 {
+        bail!(
+            "Capulus path is not a root-owned real directory: {}",
+            path.display()
+        );
     }
-    let directory = OpenOptions::new()
+    fchmod(&directory, Mode::from_raw_mode(mode)).map_err(std::io::Error::from)?;
+    directory.sync_all()?;
+    if initializing {
+        open_real_directory(path.parent().expect("managed directories have a parent"))?
+            .sync_all()?;
+    }
+    Ok(())
+}
+
+fn open_or_create_restricted_directory(
+    path: &Path,
+    boundary_owner: DirectoryOwner,
+) -> Result<(File, bool)> {
+    open_or_create_restricted_directory_with(path, boundary_owner, || Ok(()))
+}
+
+fn open_or_create_restricted_directory_with(
+    path: &Path,
+    boundary_owner: DirectoryOwner,
+    after_mkdir: impl FnOnce() -> Result<()>,
+) -> Result<(File, bool)> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| anyhow!("managed directory has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("managed directory has no name: {}", path.display()))?;
+    let parent = open_real_directory(parent_path)
+        .with_context(|| format!("failed to open {}", parent_path.display()))?;
+    let created = match mkdirat(&parent, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::EXIST) => false,
+        Err(error) => return Err(std::io::Error::from(error).into()),
+    };
+    if created {
+        after_mkdir()?;
+        chmodat(&parent, name, Mode::from_raw_mode(0o700), AtFlags::empty())
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("failed to normalize {}", path.display()))?;
+    }
+    let directory = open_directory_at(&parent, name)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    if !created
+        && DirectoryIdentity::from_metadata(&directory.metadata()?)
+            .is_restricted_creation(boundary_owner)
+    {
+        require_empty_directory(&directory, path)?;
+        set_directory_mode_and_sync(
+            &directory,
+            0o700,
+            &format!("failed to resume creating {}", path.display()),
+        )?;
+        return Ok((directory, true));
+    }
+    Ok((directory, created))
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> Result<File> {
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| std::io::Error::from(error).into())
+}
+
+fn require_empty_directory(directory: &File, path: &Path) -> Result<()> {
+    let mut buffer = [MaybeUninit::uninit(); 4096];
+    let mut entries = RawDir::new(directory, &mut buffer);
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(std::io::Error::from)?;
+        if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
+            bail!(
+                "interrupted Capulus directory creation is not empty: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn open_real_directory(path: &Path) -> Result<File> {
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    fchmod(&directory, Mode::from_raw_mode(mode)).map_err(std::io::Error::from)?;
+        .open(path)
+        .map_err(Into::into)
+}
+
+fn set_directory_owner_and_sync(
+    directory: &File,
+    owner: DirectoryOwner,
+    context: &str,
+) -> Result<()> {
+    fchown(
+        directory,
+        Some(Uid::from_raw(owner.uid)),
+        Some(Gid::from_raw(owner.gid)),
+    )
+    .map_err(std::io::Error::from)
+    .with_context(|| context.to_owned())?;
+    directory.sync_all().map_err(Into::into)
+}
+
+fn set_directory_mode_and_sync(directory: &File, mode: u32, context: &str) -> Result<()> {
+    fchmod(directory, Mode::from_raw_mode(mode))
+        .map_err(std::io::Error::from)
+        .with_context(|| context.to_owned())?;
     directory.sync_all().map_err(Into::into)
 }
 
@@ -733,5 +1164,436 @@ mod tests {
                 .flatten(),
             Some(account.home.as_os_str())
         );
+    }
+
+    #[test]
+    fn build_boundaries_accept_only_current_prior_and_interrupted_states() {
+        let prior_owner = DirectoryOwner { uid: 997, gid: 973 };
+        assert_eq!(
+            classify_test_boundary(0, 0, 0o711, prior_owner).unwrap(),
+            BoundaryState::Current
+        );
+        assert_eq!(
+            classify_test_boundary(prior_owner.uid, prior_owner.gid, 0o700, prior_owner).unwrap(),
+            BoundaryState::PriorLayout
+        );
+        assert_eq!(
+            classify_test_boundary(0, 0, 0o700, prior_owner).unwrap(),
+            BoundaryState::OwnershipSecured
+        );
+        assert_eq!(
+            PrivateDirectoryState::classify(
+                DirectoryIdentity {
+                    is_directory: true,
+                    uid: prior_owner.uid,
+                    gid: prior_owner.gid,
+                    mode: 0o700,
+                },
+                prior_owner,
+                DirectoryOwner::ROOT,
+            )
+            .unwrap(),
+            PrivateDirectoryState::Current
+        );
+        assert_eq!(
+            PrivateDirectoryState::classify(
+                DirectoryIdentity {
+                    is_directory: true,
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o700,
+                },
+                prior_owner,
+                DirectoryOwner::ROOT,
+            )
+            .unwrap(),
+            PrivateDirectoryState::CreationInterrupted
+        );
+        for mode in [0o000, 0o100, 0o300, 0o500, 0o600] {
+            assert!(
+                DirectoryIdentity {
+                    is_directory: true,
+                    uid: 0,
+                    gid: 0,
+                    mode,
+                }
+                .is_restricted_creation(DirectoryOwner::ROOT)
+            );
+        }
+        for mode in [0o700, 0o701, 0o711, 0o1700] {
+            assert!(
+                !DirectoryIdentity {
+                    is_directory: true,
+                    uid: 0,
+                    gid: 0,
+                    mode,
+                }
+                .is_restricted_creation(DirectoryOwner::ROOT)
+            );
+        }
+        for (is_directory, uid, gid, mode) in [
+            (false, 0, 0, 0o711),
+            (true, 0, 0, 0o755),
+            (true, 0, 0, 0o701),
+            (true, prior_owner.uid, prior_owner.gid, 0o711),
+            (true, 1234, prior_owner.gid, 0o700),
+        ] {
+            assert!(
+                BoundaryState::classify(
+                    DirectoryIdentity {
+                        is_directory,
+                        uid,
+                        gid,
+                        mode,
+                    },
+                    prior_owner,
+                    DirectoryOwner::ROOT,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn build_paths_require_one_canonical_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut build = test_build(temporary.path().join("capulus-build")).build;
+        assert_eq!(
+            build.home().unwrap(),
+            temporary.path().join("capulus-build")
+        );
+        build.jobs_home = temporary.path().join("other/jobs");
+        assert!(build.home().is_err());
+    }
+
+    #[test]
+    fn prior_layout_is_migrated_once_without_replacing_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = test_build(temporary.path().join("capulus-build"));
+        create_layout(&build, 0o700, 0o700);
+        fs::write(build.cache_home.join("preserved"), b"cache").unwrap();
+        fs::write(build.jobs_home.join("preserved"), b"job").unwrap();
+        let inodes = layout_inodes(&build);
+
+        build.ensure_layout().unwrap();
+        assert_current_layout(&build);
+        assert_eq!(
+            fs::read(build.cache_home.join("preserved")).unwrap(),
+            b"cache"
+        );
+        assert_eq!(fs::read(build.jobs_home.join("preserved")).unwrap(), b"job");
+        assert_eq!(layout_inodes(&build), inodes);
+
+        build.ensure_layout().unwrap();
+        assert_current_layout(&build);
+        assert_eq!(layout_inodes(&build), inodes);
+    }
+
+    #[test]
+    fn migration_resumes_after_each_jobs_boundary_transition() {
+        let temporary = tempfile::tempdir().unwrap();
+        for (name, jobs_mode) in [("jobs-ownership-secured", 0o700), ("jobs-current", 0o711)] {
+            let build = test_build(temporary.path().join(name));
+            create_layout(&build, 0o700, jobs_mode);
+            set_test_owner(&build.home, build.boundary_owner);
+            set_test_owner(&build.jobs_home, build.boundary_owner);
+
+            build.ensure_layout().unwrap();
+            assert_current_layout(&build);
+        }
+    }
+
+    #[test]
+    fn current_layout_completes_missing_known_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = test_build(temporary.path().join("capulus-build"));
+        create_test_directory(&build.home, 0o711);
+        set_test_owner(&build.home, build.boundary_owner);
+        for path in build.private_directories().into_iter().take(2) {
+            create_test_directory(path, 0o700);
+        }
+
+        build.ensure_layout().unwrap();
+        assert_current_layout(&build);
+
+        let build = test_build(temporary.path().join("jobs-creation-interrupted"));
+        create_layout(&build, 0o711, 0o700);
+        set_test_owner(&build.jobs_home, build.boundary_owner);
+        build.ensure_layout().unwrap();
+        assert_current_layout(&build);
+    }
+
+    #[test]
+    fn private_directory_creation_resumes_from_the_restricted_boundary_owner_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = test_build(temporary.path().join("capulus-build"));
+        create_test_directory(&build.home, 0o700);
+        set_test_owner(&build.home, build.boundary_owner);
+        create_test_directory(&build.cache_home, 0o700);
+        set_test_owner(&build.cache_home, build.boundary_owner);
+        let inode = fs::symlink_metadata(&build.cache_home).unwrap().ino();
+
+        build.ensure_private_directory(&build.cache_home).unwrap();
+
+        assert_owned_mode(&build.cache_home, DirectoryOwner::of(&build.account), 0o700);
+        assert_eq!(
+            fs::symlink_metadata(&build.cache_home).unwrap().ino(),
+            inode
+        );
+    }
+
+    #[test]
+    fn interrupted_private_directory_creation_must_still_be_empty() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = test_build(temporary.path().join("capulus-build"));
+        create_test_directory(&build.home, 0o700);
+        set_test_owner(&build.home, build.boundary_owner);
+        create_test_directory(&build.cache_home, 0o700);
+        set_test_owner(&build.cache_home, build.boundary_owner);
+        fs::write(build.cache_home.join("unexpected"), b"data").unwrap();
+
+        if build.boundary_owner == DirectoryOwner::of(&build.account) {
+            assert!(
+                require_empty_directory(
+                    &open_real_directory(&build.cache_home).unwrap(),
+                    &build.cache_home,
+                )
+                .is_err()
+            );
+        } else {
+            assert!(build.ensure_private_directory(&build.cache_home).is_err());
+        }
+    }
+
+    #[test]
+    fn restricted_creation_and_interrupted_retry_are_umask_independent() {
+        const CHILD: &str = "CAPULUS_RESTRICTIVE_UMASK_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let temporary = tempfile::tempdir().unwrap();
+            // SAFETY: the filtered child test runs alone and exits without returning to callers.
+            unsafe { libc::umask(0o777) };
+            let build = test_build(temporary.path().join("capulus-build"));
+            build.ensure_layout().unwrap();
+            assert_current_layout(&build);
+
+            // SAFETY: this remains the same isolated child test.
+            unsafe { libc::umask(0o200) };
+            let interrupted = temporary.path().join("interrupted");
+            let owner = DirectoryOwner::of(&build.account);
+            assert!(
+                open_or_create_restricted_directory_with(&interrupted, owner, || {
+                    bail!("injected post-mkdir failure")
+                })
+                .is_err()
+            );
+            assert_mode(&interrupted, 0o500);
+            let (directory, initializing) =
+                open_or_create_restricted_directory(&interrupted, owner).unwrap();
+            assert!(initializing);
+            assert!(
+                DirectoryIdentity::from_metadata(&directory.metadata().unwrap())
+                    .is_owned_directory(owner, 0o700)
+            );
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("restricted_creation_and_interrupted_retry_are_umask_independent")
+            .arg("--test-threads=1")
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn invalid_layouts_are_rejected_before_the_final_boundary_transition() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = test_build(temporary.path().join("invalid-home-mode"));
+        create_layout(&build, 0o755, 0o700);
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o755);
+
+        let build = test_build(temporary.path().join("nonempty-restricted-home"));
+        create_test_directory(&build.home, 0o700);
+        fs::write(build.home.join("unexpected"), b"data").unwrap();
+        set_test_owner(&build.home, build.boundary_owner);
+        fs::set_permissions(&build.home, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o500);
+
+        let build = test_build(temporary.path().join("unexpected-entry"));
+        create_layout(&build, 0o700, 0o700);
+        fs::write(build.home.join("unexpected"), b"unmanaged").unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o700);
+
+        let build = test_build(temporary.path().join("invalid-private"));
+        create_layout(&build, 0o700, 0o700);
+        fs::set_permissions(&build.cache_home, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o700);
+
+        let build = test_build(temporary.path().join("nonempty-restricted-private"));
+        create_layout(&build, 0o700, 0o700);
+        fs::write(build.cache_home.join("unexpected"), b"data").unwrap();
+        set_test_owner(&build.cache_home, build.boundary_owner);
+        fs::set_permissions(&build.cache_home, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.cache_home, 0o500);
+
+        let build = test_build(temporary.path().join("private-file"));
+        create_layout(&build, 0o700, 0o700);
+        fs::remove_dir(&build.cache_home).unwrap();
+        fs::write(&build.cache_home, b"not a directory").unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o700);
+
+        let build = test_build(temporary.path().join("private-symlink"));
+        create_layout(&build, 0o700, 0o700);
+        fs::remove_dir(&build.cache_home).unwrap();
+        std::os::unix::fs::symlink(&build.rustup_home, &build.cache_home).unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o700);
+
+        let build = test_build(temporary.path().join("prior-jobs-in-current-home"));
+        create_layout(&build, 0o711, 0o700);
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.jobs_home, 0o700);
+
+        let build = test_build(temporary.path().join("nonempty-current-jobs-creation"));
+        create_layout(&build, 0o711, 0o700);
+        set_test_owner(&build.jobs_home, build.boundary_owner);
+        fs::write(build.jobs_home.join("unexpected"), b"data").unwrap();
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.jobs_home, 0o700);
+
+        let build = test_build(temporary.path().join("invalid-interrupted-jobs"));
+        create_layout(&build, 0o700, 0o755);
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o700);
+        assert_mode(&build.jobs_home, 0o755);
+    }
+
+    fn classify_test_boundary(
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        prior_owner: DirectoryOwner,
+    ) -> Result<BoundaryState> {
+        BoundaryState::classify(
+            DirectoryIdentity {
+                is_directory: true,
+                uid,
+                gid,
+                mode,
+            },
+            prior_owner,
+            DirectoryOwner::ROOT,
+        )
+    }
+
+    struct TestBuild {
+        build: BuildAccount,
+        home: PathBuf,
+        boundary_owner: DirectoryOwner,
+    }
+
+    impl std::ops::Deref for TestBuild {
+        type Target = BuildAccount;
+
+        fn deref(&self) -> &Self::Target {
+            &self.build
+        }
+    }
+
+    impl TestBuild {
+        fn ensure_layout(&self) -> Result<()> {
+            self.build.ensure_layout_with(self.boundary_owner)
+        }
+
+        fn ensure_private_directory(&self, path: &Path) -> Result<()> {
+            self.build
+                .ensure_private_directory(path, self.boundary_owner)
+        }
+    }
+
+    fn test_build(home: PathBuf) -> TestBuild {
+        let account = UnixAccount::by_uid(rustix::process::geteuid().as_raw()).unwrap();
+        let boundary_owner = DirectoryOwner {
+            uid: account.uid,
+            gid: rustix::process::getgroups()
+                .unwrap()
+                .into_iter()
+                .map(|gid| gid.as_raw())
+                .find(|gid| *gid != account.gid)
+                .unwrap_or(account.gid),
+        };
+        let build = BuildAccount {
+            account,
+            cargo_tools_home: home.join("cargo-tools"),
+            rustup_home: home.join("rustup"),
+            cache_home: home.join("cache"),
+            target_home: home.join("target"),
+            jobs_home: home.join("jobs"),
+        };
+        TestBuild {
+            build,
+            home,
+            boundary_owner,
+        }
+    }
+
+    fn create_layout(build: &TestBuild, home_mode: u32, jobs_mode: u32) {
+        create_test_directory(&build.home, home_mode);
+        if home_mode == 0o711 {
+            set_test_owner(&build.home, build.boundary_owner);
+        }
+        for path in build.private_directories() {
+            create_test_directory(path, 0o700);
+        }
+        create_test_directory(&build.jobs_home, jobs_mode);
+        if jobs_mode == 0o711 {
+            set_test_owner(&build.jobs_home, build.boundary_owner);
+        }
+    }
+
+    fn create_test_directory(path: &Path, mode: u32) {
+        let mut builder = DirBuilder::new();
+        builder.mode(mode).create(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn set_test_owner(path: &Path, owner: DirectoryOwner) {
+        set_directory_owner_and_sync(&open_real_directory(path).unwrap(), owner, "test ownership")
+            .unwrap();
+    }
+
+    fn assert_current_layout(build: &TestBuild) {
+        assert_owned_mode(&build.home, build.boundary_owner, 0o711);
+        for path in build.private_directories() {
+            assert_owned_mode(path, DirectoryOwner::of(&build.account), 0o700);
+        }
+        assert_owned_mode(&build.jobs_home, build.boundary_owner, 0o711);
+    }
+
+    fn assert_owned_mode(path: &Path, owner: DirectoryOwner, mode: u32) {
+        let identity = DirectoryIdentity::from_metadata(&fs::symlink_metadata(path).unwrap());
+        assert!(identity.is_owned_directory(owner, mode));
+    }
+
+    fn assert_mode(path: &Path, mode: u32) {
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777,
+            mode
+        );
+    }
+
+    fn layout_inodes(build: &TestBuild) -> Vec<u64> {
+        std::iter::once(build.home.as_path())
+            .chain(build.private_directories())
+            .chain(std::iter::once(build.jobs_home.as_path()))
+            .map(|path| fs::symlink_metadata(path).unwrap().ino())
+            .collect()
     }
 }

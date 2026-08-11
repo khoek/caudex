@@ -79,6 +79,27 @@ Because the home itself is not writable by the build account, it cannot rename o
 top-level directory entries. Root creates and validates each boundary using non-following file
 descriptors before delegating work.
 
+An installation whose build home still has the earlier build-account-owned mode-0700 layout is
+migrated at the same serialized build boundary. The only accepted home states are that exact prior
+state, the current root-owned mode-0711 state, and the root-owned mode-0700 state left after
+ownership has been secured but before migration is committed. An empty root-owned directory whose
+mode is a strict bit-subset of 0700 is also accepted only as the deterministic state between
+`mkdirat` and initial mode normalization. capulus takes ownership through its already opened
+no-follow descriptor and fsyncs it before inspecting the now-immutable top-level names. Only the
+four private-directory names and `jobs` are accepted. Existing private directories must be
+build-account-owned mode 0700, or empty and root-owned mode 0700 or a strict subset only as an
+interrupted creation; `jobs` must be in its exact prior, creation-interrupted,
+ownership-secured, or current state. A current home never accepts a prior-layout `jobs`, and its
+mode-0700 jobs boundary must be empty because that combination can arise only during creation.
+
+Creation uses `mkdirat` and mode normalization relative to an already opened trusted parent. The
+requested mode is 0700, so a permissive umask cannot broaden it; explicit normalization prevents a
+restrictive umask from becoming final state. A strict-subset retry is opened without following
+links, proven empty, normalized through that descriptor, and fsynced. The jobs boundary is migrated
+and fsynced before the home changes to mode 0711. The home is fsynced after all child entries and
+metadata, then its final mode is set and fsynced. Unexpected names, symlinks, non-directories,
+nonempty creation states, and all other ownership or mode combinations fail closed.
+
 A global build lock serializes toolchain mutation, private registry configuration, shared caches,
 and the commit workflow across products. Root downloads and verifies rustup-init, then executes it
 as `capulus-build` with cleared supplementary groups and an exact environment. Cargo builds into a
