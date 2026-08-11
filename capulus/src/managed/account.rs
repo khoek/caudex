@@ -164,16 +164,16 @@ impl UserInstallContext {
         }
         let cargo = cargo_home.join("bin/cargo");
         let rustup = cargo_home.join("bin/rustup");
-        if !owned_executable_regular_file(&cargo, account.uid)? {
-            bail!(
-                "existing user CLI has no valid Cargo executable at {}",
-                cargo.display()
-            );
-        }
         if !owned_executable_regular_file(&rustup, account.uid)? {
             bail!(
                 "existing user CLI has no valid Rustup executable at {}",
                 rustup.display()
+            );
+        }
+        if !owned_cargo_executable(&cargo, &rustup, account.uid)? {
+            bail!(
+                "existing user CLI has no valid Cargo executable at {}",
+                cargo.display()
             );
         }
         Ok(Some(Self {
@@ -211,8 +211,8 @@ impl UserInstallContext {
                 bail!("requesting user's validated path escaped its NSS home");
             }
         }
-        if !owned_executable_regular_file(&self.cargo, self.uid)?
-            || !owned_executable_regular_file(&self.rustup, self.uid)?
+        if !owned_executable_regular_file(&self.rustup, self.uid)?
+            || !owned_cargo_executable(&self.cargo, &self.rustup, self.uid)?
             || !owned_executable_regular_file(&self.installed_binary, self.uid)?
         {
             bail!("requesting user's Cargo installation changed during redeploy");
@@ -464,6 +464,26 @@ fn owned_executable_regular_file(path: &Path, uid: u32) -> Result<bool> {
     }
 }
 
+fn owned_cargo_executable(path: &Path, rustup: &Path, uid: u32) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_file() {
+        return Ok(metadata.uid() == uid && metadata.permissions().mode() & 0o111 != 0);
+    }
+    if !metadata.file_type().is_symlink() || metadata.uid() != uid {
+        return Ok(false);
+    }
+    Ok(fs::read_link(path)? == Path::new("rustup")
+        && path.parent() == rustup.parent()
+        && rustup.file_name().is_some_and(|name| name == "rustup")
+        && owned_executable_regular_file(rustup, uid)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +510,23 @@ mod tests {
         assert!(validate_absolute_normal_path(Path::new("/home/user/.cargo")).is_ok());
         assert!(validate_absolute_normal_path(Path::new("/home/user/../root")).is_err());
         assert!(validate_absolute_normal_path(Path::new("relative")).is_err());
+    }
+
+    #[test]
+    fn standard_rustup_cargo_proxy_is_validated_without_following_arbitrary_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let rustup = directory.path().join("rustup");
+        fs::write(&rustup, b"proxy").unwrap();
+        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o700)).unwrap();
+        let cargo = directory.path().join("cargo");
+        symlink("rustup", &cargo).unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+
+        assert!(owned_cargo_executable(&cargo, &rustup, uid).unwrap());
+        fs::remove_file(&cargo).unwrap();
+        symlink("/bin/sh", &cargo).unwrap();
+        assert!(!owned_cargo_executable(&cargo, &rustup, uid).unwrap());
     }
 }
