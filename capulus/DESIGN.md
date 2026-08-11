@@ -121,13 +121,16 @@ An installation journal lives at
 
 1. validates the target manifest and build-account artifacts;
 2. records current digests and exact prior unit enablement;
-3. stages replacements and backups on each destination filesystem;
-4. represents target omissions as journaled removals; and
-5. runs `systemd-analyze verify` with a deadline over every staged unit.
+3. stages replacements and backups on each destination filesystem; and
+4. represents target omissions as journaled removals.
 
 Commit renames each old file to its same-filesystem backup, renames a replacement into place when
-present, fsyncs the destination directory, and durably advances the journal. This is a recoverable
-multi-file transaction, not a claim of globally atomic replacement.
+present, fsyncs the destination directory, and durably advances the journal. Once every target file
+is present, capulus runs `systemd-analyze verify` with a deadline against the installed unit paths,
+before systemd reloads or activates anything. This lets a first installation validate an
+`ExecStart` binary committed by the same transaction. A verification failure rolls the journaled
+files back. This is a recoverable multi-file transaction, not a claim of globally atomic
+replacement.
 
 A normal same-topology redeploy keeps listening sockets alive and restarts the service after reload.
 A topology change first quiesces both sockets and the service, removes only the exact verified

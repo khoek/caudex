@@ -184,11 +184,6 @@ impl SystemInstallation {
                 return Err(error);
             }
         }
-        if let Err(error) = installation.verify_units() {
-            installation.cleanup_staging()?;
-            remove_private_file(&installation.journal_path)?;
-            return Err(error);
-        }
         Ok(installation)
     }
 
@@ -222,7 +217,7 @@ impl SystemInstallation {
             write_journal(&self.journal_path, &self.journal)?;
         }
         self.files_committed = true;
-        Ok(())
+        self.verify_committed_units()
     }
 
     pub async fn activate(&self) -> Result<()> {
@@ -311,15 +306,8 @@ impl SystemInstallation {
         remove_private_file(journal_path)
     }
 
-    fn verify_units(&self) -> Result<()> {
-        let units = self
-            .journal
-            .records
-            .iter()
-            .filter(|record| record.destination.parent() == Some(Path::new("/etc/systemd/system")))
-            .filter(|record| record.new_digest.is_some())
-            .map(|record| record.staged.as_os_str())
-            .collect::<Vec<_>>();
+    fn verify_committed_units(&self) -> Result<()> {
+        let units = committed_unit_paths(&self.journal);
         let mut command = Command::new("/usr/bin/systemd-analyze");
         command
             .env_clear()
@@ -329,17 +317,31 @@ impl SystemInstallation {
             )
             .env("LANG", "C.UTF-8")
             .arg("verify")
-            .args(units)
+            .args(&units)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        run_with_deadline(&mut command, VERIFY_TIMEOUT, "verify staged systemd units")?;
+        run_with_deadline(
+            &mut command,
+            VERIFY_TIMEOUT,
+            "verify committed systemd units",
+        )?;
         Ok(())
     }
 
     fn cleanup_staging(&self) -> Result<()> {
         cleanup_staging(&self.journal)
     }
+}
+
+fn committed_unit_paths(journal: &InstallationJournal) -> Vec<&Path> {
+    journal
+        .records
+        .iter()
+        .filter(|record| record.destination.parent() == Some(Path::new("/etc/systemd/system")))
+        .filter(|record| record.new_digest.is_some())
+        .map(|record| record.destination.as_path())
+        .collect()
 }
 
 pub struct SystemUninstallation {
@@ -1297,10 +1299,9 @@ fn remove_private_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn journal_paths_are_fixed_to_the_product_and_job() {
+    fn first_install_journal() -> InstallationJournal {
         let job = JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
-        let journal = InstallationJournal {
+        InstallationJournal {
             product: "auc".to_string(),
             job,
             previously_enabled: Vec::new(),
@@ -1332,7 +1333,12 @@ mod tests {
                     new_digest: Some("11".repeat(32)),
                 },
             ],
-        };
+        }
+    }
+
+    #[test]
+    fn journal_paths_are_fixed_to_the_product_and_job() {
+        let journal = first_install_journal();
         journal.validate("auc").unwrap();
         let bridge_json = serde_json::to_value(&journal).unwrap();
         let bridge_fields = bridge_json.as_object().unwrap();
@@ -1415,5 +1421,13 @@ mod tests {
         };
 
         journal.validate("auc").unwrap();
+    }
+
+    #[test]
+    fn unit_verification_uses_committed_destination() {
+        assert_eq!(
+            committed_unit_paths(&first_install_journal()),
+            [Path::new("/etc/systemd/system/auc-agent.service")]
+        );
     }
 }
