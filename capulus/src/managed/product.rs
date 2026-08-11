@@ -374,7 +374,7 @@ impl ManagedProduct {
                      PrivateTmp=yes\n\
                      ProtectClock=yes\n\
                      ProtectControlGroups=yes\n\
-                     ProtectHome=yes\n\
+                     ProtectHome=read-only\n\
                      ProtectKernelLogs=yes\n\
                      ProtectKernelModules=yes\n\
                      ProtectKernelTunables=yes\n\
@@ -392,7 +392,7 @@ impl ManagedProduct {
             ServiceHardening::SystemNetworkController => concat!(
                 "PrivateTmp=yes\n",
                 "ProtectClock=yes\n",
-                "ProtectHome=yes\n",
+                "ProtectHome=read-only\n",
                 "ProtectKernelLogs=yes\n",
                 "ProtectKernelModules=yes\n",
                 "RestrictRealtime=yes\n",
@@ -861,6 +861,7 @@ mod tests {
         assert!(text.contains("ListenStream=/run/auc/agent.sock"));
         assert!(!text.contains("ListenStream=\""));
         assert!(text.contains("Requires=auc-agent.socket auc-capulus.socket"));
+        assert!(text.contains("ProtectHome=read-only"));
         assert!(text.contains("DeviceAllow=\"/dev/uhid\" rw"));
     }
 
