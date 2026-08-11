@@ -306,6 +306,9 @@ fn lookup_passwd(uid: u32, name: Option<&CStr>) -> Result<Option<UnixAccount>> {
             ),
         }
     };
+    if nss_not_found(status) {
+        return Ok(None);
+    }
     if status != 0 {
         return Err(std::io::Error::from_raw_os_error(status)).context("NSS account lookup failed");
     }
@@ -355,6 +358,9 @@ fn lookup_group(name: Option<&CStr>, gid: u32) -> Result<Option<(u32, String)>> 
             ),
         }
     };
+    if nss_not_found(status) {
+        return Ok(None);
+    }
     if status != 0 {
         return Err(std::io::Error::from_raw_os_error(status)).context("NSS group lookup failed");
     }
@@ -364,6 +370,10 @@ fn lookup_group(name: Option<&CStr>, gid: u32) -> Result<Option<(u32, String)>> 
     // SAFETY: successful NSS lookup initialized `group` with strings backed by `buffer`.
     let group = unsafe { group.assume_init() };
     Ok(Some((group.gr_gid, c_string(group.gr_name, "group name")?)))
+}
+
+fn nss_not_found(status: libc::c_int) -> bool {
+    matches!(status, libc::ENOENT | libc::ESRCH)
 }
 
 fn c_string(pointer: *const libc::c_char, field: &str) -> Result<String> {
@@ -493,6 +503,20 @@ mod tests {
         let uid = rustix::process::getuid().as_raw();
         let by_uid = UnixAccount::by_uid(uid).unwrap();
         assert_eq!(UnixAccount::by_name(&by_uid.name).unwrap(), Some(by_uid));
+    }
+
+    #[test]
+    fn missing_nss_accounts_and_groups_are_not_operational_errors() {
+        assert!(
+            UnixAccount::by_name("capulus-test-account-does-not-exist")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            group_gid("capulus-test-group-does-not-exist")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
