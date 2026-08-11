@@ -6,6 +6,11 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 const INSTALLATION_SCHEMA_MAJOR: u16 = 1;
+const MINIMUM_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAXIMUM_BUILD_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const REDEPLOY_FIXED_BUDGET: Duration = Duration::from_secs(35 * 60);
+const MINIMUM_TASKS: u64 = 16;
+const MAXIMUM_TASKS: u64 = 32_768;
 
 #[derive(Clone, Debug)]
 pub struct ManagedProductOptions {
@@ -18,7 +23,7 @@ pub struct ManagedProductOptions {
     pub service: AgentServiceOptions,
     pub application_socket: ApplicationSocketOptions,
     pub management_socket: SocketOptions,
-    pub build_timeout: Duration,
+    pub redeploy: ManagedRedeployOptions,
 }
 
 impl ManagedProductOptions {
@@ -28,9 +33,18 @@ impl ManagedProductOptions {
         if self.system_binaries.is_empty() {
             return Err(ProductValidationError::MissingSystemBinary);
         }
-        if self.build_timeout < Duration::from_secs(60) {
+        if !(MINIMUM_BUILD_TIMEOUT..=MAXIMUM_BUILD_TIMEOUT).contains(&self.redeploy.build_timeout) {
             return Err(ProductValidationError::BuildTimeout);
         }
+        if !(MINIMUM_TASKS..=MAXIMUM_TASKS).contains(&self.redeploy.maximum_tasks) {
+            return Err(ProductValidationError::MaximumTasks);
+        }
+        let runtime_max = self
+            .redeploy
+            .build_timeout
+            .checked_mul(2)
+            .and_then(|duration| duration.checked_add(REDEPLOY_FIXED_BUDGET))
+            .ok_or(ProductValidationError::RedeployRuntime)?;
         let expected_binary_directory = Path::new("/usr/local/bin");
         let mut cargo_names = BTreeSet::new();
         let mut destinations = BTreeSet::new();
@@ -96,8 +110,24 @@ impl ManagedProductOptions {
             service: self.service,
             application_socket: self.application_socket,
             management_socket: self.management_socket,
-            build_timeout: self.build_timeout,
+            redeploy: self.redeploy,
+            redeploy_runtime_max: runtime_max,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedRedeployOptions {
+    pub build_timeout: Duration,
+    pub maximum_tasks: u64,
+}
+
+impl Default for ManagedRedeployOptions {
+    fn default() -> Self {
+        Self {
+            build_timeout: Duration::from_secs(30 * 60),
+            maximum_tasks: 512,
+        }
     }
 }
 
@@ -168,7 +198,8 @@ pub struct ManagedProduct {
     service: AgentServiceOptions,
     application_socket: ApplicationSocketOptions,
     management_socket: SocketOptions,
-    build_timeout: Duration,
+    redeploy: ManagedRedeployOptions,
+    redeploy_runtime_max: Duration,
 }
 
 impl ManagedProduct {
@@ -193,7 +224,15 @@ impl ManagedProduct {
     }
 
     pub fn build_timeout(&self) -> Duration {
-        self.build_timeout
+        self.redeploy.build_timeout
+    }
+
+    pub fn maximum_tasks(&self) -> u64 {
+        self.redeploy.maximum_tasks
+    }
+
+    pub fn redeploy_runtime_max(&self) -> Duration {
+        self.redeploy_runtime_max
     }
 
     pub fn application_socket_path(&self) -> &Path {
@@ -365,7 +404,12 @@ impl ManagedProduct {
                 read_write_paths,
                 device_allow,
             } => {
-                let read_write_paths = render_path_list("ReadWritePaths", read_write_paths);
+                let mut read_write_paths = read_write_paths.clone();
+                let capulus_state = PathBuf::from("/var/lib/capulus");
+                if !read_write_paths.contains(&capulus_state) {
+                    read_write_paths.push(capulus_state);
+                }
+                let read_write_paths = render_path_list("ReadWritePaths", &read_write_paths);
                 let device_allow = device_allow
                     .iter()
                     .map(|path| format!("DeviceAllow={} rw\n", quote_systemd_path(path)))
@@ -425,7 +469,7 @@ impl ManagedProduct {
              RuntimeDirectory={} capulus\n\
              RuntimeDirectoryMode=0755\n\
              RuntimeDirectoryPreserve=yes\n\
-             StateDirectory={} capulus\n\
+             StateDirectory={}\n\
              StateDirectoryMode={:04o}\n\
              {hardening}\
              \n\
@@ -597,6 +641,10 @@ pub enum ProductValidationError {
     MissingSystemBinary,
     #[error("managed build timeout must be at least 60 seconds")]
     BuildTimeout,
+    #[error("managed redeploy task limit must be between 16 and 32768")]
+    MaximumTasks,
+    #[error("managed redeploy runtime limit cannot be represented")]
+    RedeployRuntime,
     #[error("managed binary destination must be directly beneath /usr/local/bin: {0}")]
     BinaryDestination(PathBuf),
     #[error("Cargo binary {cargo_name:?} does not match destination {destination}")]
@@ -659,19 +707,22 @@ pub enum ProductValidationError {
 }
 
 fn validate_identifier(field: &'static str, value: &str) -> Result<(), ProductValidationError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
-        || !value.as_bytes()[0].is_ascii_lowercase()
-    {
+    if !is_valid_identifier(value) {
         return Err(ProductValidationError::Identifier {
             field,
             value: value.to_string(),
         });
     }
     Ok(())
+}
+
+pub(super) fn is_valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 fn validate_service(
@@ -696,6 +747,9 @@ fn validate_service(
     if !(Duration::from_secs(1)..=Duration::from_secs(60 * 60)).contains(&service.restart_delay) {
         return Err(ProductValidationError::RestartDelay);
     }
+    if service.restart_delay.subsec_nanos() != 0 {
+        return Err(ProductValidationError::RestartDelay);
+    }
     if service.state_directory_mode > 0o777 || service.state_directory_mode & 0o700 != 0o700 {
         return Err(ProductValidationError::StateDirectoryMode);
     }
@@ -706,6 +760,7 @@ fn validate_service(
     {
         for path in read_write_paths.iter().chain(device_allow) {
             validate_absolute_path(path)?;
+            validate_systemd_path(path)?;
             if !path.starts_with(format!("/var/lib/{product}"))
                 && !path.starts_with(format!("/run/{product}"))
                 && !path.starts_with("/dev/")
@@ -765,7 +820,17 @@ fn unsafe_unit_text(value: &str) -> bool {
 }
 
 fn quote_systemd_path(path: &Path) -> String {
-    quote_systemd_word(&path.display().to_string())
+    quote_systemd_word(path.to_str().expect("validated systemd path is UTF-8"))
+}
+
+fn validate_systemd_path(path: &Path) -> Result<(), ProductValidationError> {
+    let Some(value) = path.to_str() else {
+        return Err(ProductValidationError::UnsafePath(path.to_path_buf()));
+    };
+    if unsafe_unit_text(value) {
+        return Err(ProductValidationError::UnsafePath(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn quote_systemd_word(value: &str) -> String {
@@ -846,7 +911,10 @@ mod tests {
                 mode: 0o660,
                 group: Some("auc".to_string()),
             },
-            build_timeout: Duration::from_secs(20 * 60),
+            redeploy: ManagedRedeployOptions {
+                build_timeout: Duration::from_secs(20 * 60),
+                ..ManagedRedeployOptions::default()
+            },
         }
     }
 
@@ -873,7 +941,8 @@ mod tests {
         assert!(text.contains("ProtectHome=read-only"));
         assert!(text.contains("RuntimeDirectory=auc capulus"));
         assert!(text.contains("RuntimeDirectoryPreserve=yes"));
-        assert!(text.contains("StateDirectory=auc capulus"));
+        assert!(text.contains("StateDirectory=auc\n"));
+        assert!(text.contains("ReadWritePaths=\"/var/lib/auc\" \"/var/lib/capulus\""));
         assert!(text.contains("StateDirectoryMode=0700"));
         assert!(text.contains("DeviceAllow=\"/dev/uhid\" rw"));
     }
@@ -921,6 +990,29 @@ mod tests {
         *destination = PathBuf::from("/etc/systemd/system/other.service");
 
         assert!(manifest.validate("auc").is_err());
+    }
+
+    #[test]
+    fn redeploy_limits_and_whole_second_restart_delay_are_validated() {
+        let mut invalid = options();
+        invalid.redeploy.maximum_tasks = 0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProductValidationError::MaximumTasks)
+        ));
+
+        let mut invalid = options();
+        invalid.service.restart_delay = Duration::from_millis(1500);
+        assert!(matches!(
+            invalid.validate(),
+            Err(ProductValidationError::RestartDelay)
+        ));
+
+        let product = options().validate().unwrap();
+        assert_eq!(
+            product.redeploy_runtime_max(),
+            product.build_timeout() * 2 + REDEPLOY_FIXED_BUDGET
+        );
     }
 
     #[test]

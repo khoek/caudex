@@ -1,15 +1,17 @@
-use std::ffi::{CStr, CString};
-use std::fs;
+use std::ffi::{CStr, CString, OsStr};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::fs::{Gid, Uid, chown};
+use rustix::fs::{Gid, Mode, Uid, fchmod, fchown};
 use serde::{Deserialize, Serialize};
 
-use super::PeerCredentials;
+use super::product::is_valid_identifier;
+use super::{JobId, PeerCredentials};
 
 pub const BUILD_USER: &str = "capulus-build";
 pub const BUILD_GROUP: &str = "capulus-build";
@@ -19,6 +21,7 @@ pub const BUILD_RUSTUP_HOME: &str = "/var/lib/capulus-build/rustup";
 pub const BUILD_CACHE_HOME: &str = "/var/lib/capulus-build/cache";
 pub const BUILD_TARGET_HOME: &str = "/var/lib/capulus-build/target";
 pub const BUILD_JOBS_HOME: &str = "/var/lib/capulus-build/jobs";
+const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnixAccount {
@@ -53,6 +56,86 @@ impl UnixAccount {
         }
         Ok(())
     }
+
+    pub(super) fn command(
+        &self,
+        program: impl AsRef<OsStr>,
+        supplementary_groups: SupplementaryGroups,
+    ) -> Command {
+        let mut command = Command::new("/usr/bin/setpriv");
+        command
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("USER", &self.name)
+            .env("LOGNAME", &self.name)
+            .env("SHELL", &self.shell)
+            .env("PATH", SYSTEM_PATH)
+            .env("LANG", "C.UTF-8")
+            .args([
+                format!("--reuid={}", self.uid),
+                format!("--regid={}", self.gid),
+                supplementary_groups.setpriv_argument().to_string(),
+                "--".to_string(),
+            ])
+            .arg(program)
+            .current_dir(&self.home)
+            .stdin(Stdio::null());
+        command
+    }
+
+    pub(super) fn create_file(&self, path: &Path, mode: u32) -> Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        fchown(
+            &file,
+            Some(Uid::from_raw(self.uid)),
+            Some(Gid::from_raw(self.gid)),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("failed to set ownership on {}", path.display()))?;
+        fchmod(&file, Mode::from_raw_mode(mode))
+            .map_err(std::io::Error::from)
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        Ok(file)
+    }
+
+    pub(super) fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+        let mut file = self.create_file(path, mode)?;
+        file.write_all(bytes)?;
+        file.sync_all().map_err(Into::into)
+    }
+
+    fn validate_build_account(&self) -> Result<()> {
+        if self.uid == 0
+            || self.gid == 0
+            || self.uid >= login_id_min("UID_MIN")?
+            || self.gid >= login_id_min("GID_MIN")?
+        {
+            bail!("{BUILD_USER} must be a non-root system account and group");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SupplementaryGroups {
+    Initialize,
+    Clear,
+}
+
+impl SupplementaryGroups {
+    fn setpriv_argument(self) -> &'static str {
+        match self {
+            Self::Initialize => "--init-groups",
+            Self::Clear => "--clear-groups",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -77,7 +160,7 @@ impl BuildAccount {
                     BUILD_GROUP,
                     "--home-dir",
                     BUILD_HOME,
-                    "--create-home",
+                    "--no-create-home",
                     "--shell",
                     "/usr/sbin/nologin",
                     BUILD_USER,
@@ -87,6 +170,7 @@ impl BuildAccount {
         }
         let account = UnixAccount::by_name(BUILD_USER)?
             .ok_or_else(|| anyhow!("shared Capulus build account was not created"))?;
+        account.validate_build_account()?;
         if account.home != Path::new(BUILD_HOME)
             || account.shell != Path::new("/usr/sbin/nologin")
             || group_name(account.gid)?.as_deref() != Some(BUILD_GROUP)
@@ -103,16 +187,16 @@ impl BuildAccount {
             target_home: PathBuf::from(BUILD_TARGET_HOME),
             jobs_home: PathBuf::from(BUILD_JOBS_HOME),
         };
-        ensure_owned_directory(Path::new(BUILD_HOME), &build.account, 0o700)?;
+        ensure_root_directory(Path::new(BUILD_HOME), 0o711)?;
         for path in [
             &build.cargo_tools_home,
             &build.rustup_home,
             &build.cache_home,
             &build.target_home,
-            &build.jobs_home,
         ] {
             ensure_owned_directory(path, &build.account, 0o700)?;
         }
+        ensure_root_directory(&build.jobs_home, 0o711)?;
         Ok(build)
     }
 
@@ -122,6 +206,47 @@ impl BuildAccount {
 
     pub fn rustup(&self) -> PathBuf {
         self.cargo_tools_home.join("bin/rustup")
+    }
+
+    pub(super) fn command(&self, program: impl AsRef<OsStr>, cargo_home: &Path) -> Command {
+        let mut path = self.cargo_tools_home.join("bin").into_os_string();
+        path.push(":");
+        path.push(SYSTEM_PATH);
+        let mut command = self.account.command(program, SupplementaryGroups::Clear);
+        command
+            .env("CARGO_HOME", cargo_home)
+            .env("RUSTUP_HOME", &self.rustup_home)
+            .env("CARGO_TARGET_DIR", &self.target_home)
+            .env("PATH", path);
+        command
+    }
+
+    pub(super) fn remove_orphaned_jobs(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.jobs_home)
+            .with_context(|| format!("failed to inspect {}", self.jobs_home.display()))?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| anyhow!("Capulus build job has a non-UTF-8 name"))?;
+            let Some((product, job)) = name.rsplit_once('-') else {
+                bail!("Capulus build job has an invalid name: {name:?}");
+            };
+            if !is_valid_identifier(product) || JobId::parse(job).is_err() {
+                bail!("Capulus build job has an invalid name: {name:?}");
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != self.account.uid
+                || metadata.gid() != self.account.gid
+            {
+                bail!("Capulus build job is not an owned real directory: {name:?}");
+            }
+            fs::remove_dir_all(entry.path())
+                .with_context(|| format!("failed to remove orphaned Capulus build job {name}"))?;
+        }
+        File::open(&self.jobs_home)?.sync_all().map_err(Into::into)
     }
 }
 
@@ -256,15 +381,43 @@ pub(super) fn ensure_owned_directory(path: &Path, account: &UnixAccount, mode: u
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
         }
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("failed to chmod {}", path.display()))?;
-    chown(
-        path,
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    fchown(
+        &directory,
         Some(Uid::from_raw(account.uid)),
         Some(Gid::from_raw(account.gid)),
     )
     .map_err(std::io::Error::from)
-    .with_context(|| format!("failed to chown {}", path.display()))
+    .with_context(|| format!("failed to chown {}", path.display()))?;
+    fchmod(&directory, Mode::from_raw_mode(mode))
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("failed to chmod {}", path.display()))
+}
+
+pub(super) fn ensure_root_directory(path: &Path, mode: u32) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_dir() || metadata.uid() != 0 || metadata.gid() != 0 =>
+        {
+            bail!(
+                "Capulus path is not a root-owned real directory: {}",
+                path.display()
+            )
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(path)?,
+        Err(error) => return Err(error.into()),
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    fchmod(&directory, Mode::from_raw_mode(mode)).map_err(std::io::Error::from)?;
+    directory.sync_all().map_err(Into::into)
 }
 
 fn checked_command(command: &mut Command, action: &str) -> Result<()> {
@@ -399,20 +552,24 @@ fn passwd_buffer_len() -> usize {
 }
 
 fn login_uid_min() -> Result<u32> {
+    login_id_min("UID_MIN")
+}
+
+fn login_id_min(name: &str) -> Result<u32> {
     let contents =
         fs::read_to_string("/etc/login.defs").context("failed to read /etc/login.defs")?;
     for line in contents.lines() {
         let line = line.split('#').next().unwrap_or_default().trim();
         let mut fields = line.split_whitespace();
-        if fields.next() == Some("UID_MIN") {
+        if fields.next() == Some(name) {
             return fields
                 .next()
-                .ok_or_else(|| anyhow!("UID_MIN has no value in /etc/login.defs"))?
+                .ok_or_else(|| anyhow!("{name} has no value in /etc/login.defs"))?
                 .parse()
-                .context("UID_MIN is invalid in /etc/login.defs");
+                .with_context(|| format!("{name} is invalid in /etc/login.defs"));
         }
     }
-    bail!("/etc/login.defs does not define UID_MIN")
+    bail!("/etc/login.defs does not define {name}")
 }
 
 fn validate_peer_process(peer: PeerCredentials, account: &UnixAccount) -> Result<()> {
@@ -552,5 +709,29 @@ mod tests {
         fs::remove_file(&cargo).unwrap();
         symlink("/bin/sh", &cargo).unwrap();
         assert!(!owned_cargo_executable(&cargo, &rustup, uid).unwrap());
+    }
+
+    #[test]
+    fn account_command_uses_one_exact_setpriv_boundary() {
+        let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
+        let command = account.command("/bin/true", SupplementaryGroups::Initialize);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/setpriv"));
+        assert!(arguments.contains(&format!("--reuid={}", account.uid)));
+        assert!(arguments.contains(&format!("--regid={}", account.gid)));
+        assert!(arguments.contains(&"--init-groups".to_string()));
+        assert!(!arguments.contains(&"--reset-env".to_string()));
+        assert_eq!(command.get_current_dir(), Some(account.home.as_path()));
+        assert_eq!(
+            command
+                .get_envs()
+                .find_map(|(name, value)| (name == "HOME").then_some(value))
+                .flatten(),
+            Some(account.home.as_os_str())
+        );
     }
 }

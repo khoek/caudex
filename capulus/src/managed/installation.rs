@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -17,6 +17,7 @@ use super::{
 };
 
 const INSTALLATION_STATE_ROOT: &str = "/var/lib/capulus/installations";
+const INSTALLATION_LOCK_ROOT: &str = "/run/capulus/locks";
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SystemInstallation {
@@ -24,11 +25,14 @@ pub struct SystemInstallation {
     journal_path: PathBuf,
     journal: InstallationJournal,
     files_committed: bool,
+    _lock: crate::InvocationLock,
 }
 
 impl SystemInstallation {
     pub async fn inspect_and_repair(product: &ManagedProduct) -> Result<RepairOutcome> {
         require_root()?;
+        let _lock = acquire_installation_lock(product)?;
+        ensure_installation_state_directory(product)?;
         let installation_journal = Path::new(INSTALLATION_STATE_ROOT)
             .join(product.name())
             .join("active.json");
@@ -100,9 +104,8 @@ impl SystemInstallation {
         build_account: &UnixAccount,
     ) -> Result<Self> {
         require_root()?;
-        let state_directory = Path::new(INSTALLATION_STATE_ROOT).join(product.name());
-        ensure_root_directory(Path::new(INSTALLATION_STATE_ROOT), 0o700)?;
-        ensure_root_directory(&state_directory, 0o700)?;
+        let lock = acquire_installation_lock(product)?;
+        let state_directory = ensure_installation_state_directory(product)?;
         let journal_path = state_directory.join("active.json");
         if journal_path.exists() {
             Self::recover(product, &journal_path).await?;
@@ -110,12 +113,43 @@ impl SystemInstallation {
         recover_uninstallation(product).await?;
         artifacts.validate(product, build_account)?;
         let previously_enabled = SystemdManager.enabled_units(product).await?;
-        let records = artifacts
+        let target_files = artifacts
             .manifest
             .files
             .iter()
-            .map(|file| plan_record(product, job, artifacts, build_account, file))
+            .map(|file| (managed_destination(file).to_path_buf(), file))
+            .collect::<BTreeMap<_, _>>();
+        let mut records = artifacts
+            .manifest
+            .files
+            .iter()
+            .map(|file| {
+                plan_record(
+                    product,
+                    job,
+                    artifacts,
+                    build_account,
+                    managed_destination(file),
+                    Some(file),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
+        for destination in product
+            .installation_manifest()
+            .files
+            .iter()
+            .map(managed_destination)
+            .filter(|destination| !target_files.contains_key(*destination))
+        {
+            records.push(plan_record(
+                product,
+                job,
+                artifacts,
+                build_account,
+                destination,
+                None,
+            )?);
+        }
         let previous_service_file = records.iter().any(|record| {
             record.destination == Path::new("/etc/systemd/system").join(product.service_name())
                 && record.original_digest.is_some()
@@ -127,6 +161,7 @@ impl SystemInstallation {
             target_enable_units: artifacts.manifest.enable_units.clone(),
             previous_service_file,
             committed_records: 0,
+            accepted: false,
             records,
         };
         write_journal(&journal_path, &journal)?;
@@ -135,14 +170,15 @@ impl SystemInstallation {
             journal_path,
             journal,
             files_committed: false,
+            _lock: lock,
         };
-        for (record, managed) in installation
-            .journal
-            .records
-            .iter()
-            .zip(&artifacts.manifest.files)
-        {
-            if let Err(error) = stage_record(record, artifacts, build_account, managed) {
+        for record in &installation.journal.records {
+            if let Err(error) = stage_record(
+                record,
+                artifacts,
+                build_account,
+                target_files.get(&record.destination).copied(),
+            ) {
                 installation.cleanup_staging()?;
                 remove_private_file(&installation.journal_path)?;
                 return Err(error);
@@ -168,12 +204,14 @@ impl SystemInstallation {
                     )
                 })?;
             }
-            fs::rename(&record.staged, &record.destination).with_context(|| {
-                format!(
-                    "failed to install staged file {}",
-                    record.destination.display()
-                )
-            })?;
+            if record.new_digest.is_some() {
+                fs::rename(&record.staged, &record.destination).with_context(|| {
+                    format!(
+                        "failed to install staged file {}",
+                        record.destination.display()
+                    )
+                })?;
+            }
             sync_directory(
                 record
                     .destination
@@ -192,12 +230,21 @@ impl SystemInstallation {
             bail!("cannot activate an uncommitted Capulus installation");
         }
         SystemdManager
-            .activate_installation(&self.product, &self.journal.target_enable_units)
+            .activate_installation(
+                &self.product,
+                &self.journal.target_enable_units,
+                &self.journal.previously_enabled,
+                self.journal.previous_service_file,
+                self.journal.previous_application_socket_file(),
+            )
             .await
             .map_err(Into::into)
     }
 
     pub async fn rollback(&mut self) -> Result<()> {
+        if self.journal.accepted {
+            bail!("cannot roll back an accepted Capulus installation");
+        }
         let filesystem_result = rollback_files(&self.journal);
         let systemd_result = SystemdManager
             .restore_installation(
@@ -205,6 +252,7 @@ impl SystemInstallation {
                 &self.journal.target_enable_units,
                 &self.journal.previously_enabled,
                 self.journal.previous_service_file,
+                self.journal.previous_application_socket_file(),
             )
             .await;
         match (filesystem_result, systemd_result) {
@@ -225,6 +273,8 @@ impl SystemInstallation {
         if !self.files_committed {
             bail!("cannot finalize an uncommitted Capulus installation");
         }
+        self.journal.accepted = true;
+        write_journal(&self.journal_path, &self.journal)?;
         self.cleanup_staging()?;
         remove_private_file(&self.journal_path)
     }
@@ -233,20 +283,30 @@ impl SystemInstallation {
         self.files_committed
     }
 
+    pub fn acceptance_committed(&self) -> bool {
+        self.journal.accepted
+    }
+
     async fn recover(product: &ManagedProduct, journal_path: &Path) -> Result<()> {
         validate_private_file(journal_path)?;
         let journal: InstallationJournal = serde_json::from_slice(&fs::read(journal_path)?)
             .context("failed to decode interrupted Capulus installation journal")?;
         journal.validate(product.name())?;
-        rollback_files(&journal)?;
-        SystemdManager
-            .restore_installation(
-                product,
-                &journal.target_enable_units,
-                &journal.previously_enabled,
-                journal.previous_service_file,
-            )
-            .await?;
+        if journal.accepted {
+            validate_committed_files(&journal)?;
+            SystemdManager.refresh_installation(product).await?;
+        } else {
+            rollback_files(&journal)?;
+            SystemdManager
+                .restore_installation(
+                    product,
+                    &journal.target_enable_units,
+                    &journal.previously_enabled,
+                    journal.previous_service_file,
+                    journal.previous_application_socket_file(),
+                )
+                .await?;
+        }
         cleanup_staging(&journal)?;
         remove_private_file(journal_path)
     }
@@ -257,6 +317,7 @@ impl SystemInstallation {
             .records
             .iter()
             .filter(|record| record.destination.parent() == Some(Path::new("/etc/systemd/system")))
+            .filter(|record| record.new_digest.is_some())
             .map(|record| record.staged.as_os_str())
             .collect::<Vec<_>>();
         let mut command = Command::new("/usr/bin/systemd-analyze");
@@ -286,14 +347,14 @@ pub struct SystemUninstallation {
     journal_path: PathBuf,
     journal: UninstallationJournal,
     deactivated: bool,
+    _lock: crate::InvocationLock,
 }
 
 impl SystemUninstallation {
     pub async fn prepare(product: &ManagedProduct, job: JobId) -> Result<Self> {
         require_root()?;
-        let state_directory = Path::new(INSTALLATION_STATE_ROOT).join(product.name());
-        ensure_root_directory(Path::new(INSTALLATION_STATE_ROOT), 0o700)?;
-        ensure_root_directory(&state_directory, 0o700)?;
+        let lock = acquire_installation_lock(product)?;
+        let state_directory = ensure_installation_state_directory(product)?;
         let installation_journal = state_directory.join("active.json");
         if installation_journal.exists() {
             SystemInstallation::recover(product, &installation_journal).await?;
@@ -321,6 +382,7 @@ impl SystemUninstallation {
             journal_path,
             journal,
             deactivated: false,
+            _lock: lock,
         })
     }
 
@@ -407,6 +469,7 @@ impl SystemUninstallation {
                 &self.product.installation_manifest().enable_units,
                 &self.journal.previously_enabled,
                 true,
+                self.product.application_socket_is_systemd_activated(),
             )
             .await;
         match (filesystem, systemd) {
@@ -496,14 +559,25 @@ struct InstallationJournal {
     target_enable_units: Vec<String>,
     previous_service_file: bool,
     committed_records: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    accepted: bool,
     records: Vec<InstallationRecord>,
 }
 
 impl InstallationJournal {
+    fn previous_application_socket_file(&self) -> bool {
+        self.records.iter().any(|record| {
+            record.destination
+                == Path::new("/etc/systemd/system").join(format!("{}-agent.socket", self.product))
+                && record.original_digest.is_some()
+        })
+    }
+
     fn validate(&self, product: &str) -> Result<()> {
         if self.product != product
             || self.records.is_empty()
             || self.committed_records > self.records.len()
+            || (self.accepted && self.committed_records != self.records.len())
             || self.target_enable_units.is_empty()
         {
             bail!("interrupted Capulus installation journal has the wrong identity");
@@ -543,7 +617,10 @@ impl InstallationJournal {
             if !valid_destination
                 || record.staged != parent.join(&stage_component).join("new").join(name)
                 || record.backup != parent.join(&stage_component).join("old").join(name)
-                || !valid_digest(&record.new_digest)
+                || record
+                    .new_digest
+                    .as_ref()
+                    .is_some_and(|digest| !valid_digest(digest))
                 || record
                     .original_digest
                     .as_ref()
@@ -558,10 +635,22 @@ impl InstallationJournal {
             || target_units.iter().any(|unit| {
                 !unit.starts_with(&allowed_units)
                     || !(unit.ends_with(".service") || unit.ends_with(".socket"))
-                    || !destinations.contains(&Path::new("/etc/systemd/system").join(unit))
+                    || !self.records.iter().any(|record| {
+                        record.destination == Path::new("/etc/systemd/system").join(unit)
+                            && record.new_digest.is_some()
+                    })
             })
         {
             bail!("interrupted Capulus installation journal has unsafe target units");
+        }
+        let previous_file_exists = |unit: &str| {
+            let path = Path::new("/etc/systemd/system").join(unit);
+            self.records
+                .iter()
+                .any(|record| record.destination == path && record.original_digest.is_some())
+        };
+        if self.previous_service_file != previous_file_exists(&format!("{product}-agent.service")) {
+            bail!("interrupted Capulus installation journal has inconsistent prior units");
         }
         Ok(())
     }
@@ -574,7 +663,7 @@ struct InstallationRecord {
     staged: PathBuf,
     backup: PathBuf,
     original_digest: Option<String>,
-    new_digest: String,
+    new_digest: Option<String>,
 }
 
 fn plan_record(
@@ -582,13 +671,9 @@ fn plan_record(
     job: JobId,
     artifacts: &BuildArtifacts,
     build_account: &UnixAccount,
-    managed: &ManagedFile,
+    destination: &Path,
+    managed: Option<&ManagedFile>,
 ) -> Result<InstallationRecord> {
-    let destination = match managed {
-        ManagedFile::Binary { destination, .. } | ManagedFile::Text { destination, .. } => {
-            destination.clone()
-        }
-    };
     let parent = destination
         .parent()
         .ok_or_else(|| anyhow!("managed destination has no parent"))?;
@@ -599,16 +684,19 @@ fn plan_record(
         .ok_or_else(|| anyhow!("managed destination has no filename"))?;
     let staged = stage_root.join("new").join(filename);
     let backup = stage_root.join("old").join(filename);
-    let new_digest = match managed {
-        ManagedFile::Binary { source_name, .. } => {
-            validated_artifact_digest(&artifacts.binary_directory.join(source_name), build_account)?
-        }
-        ManagedFile::Text { contents, .. } => bytes_digest(contents.as_bytes()),
-    };
-    let original_digest = match fs::symlink_metadata(&destination) {
+    let new_digest = managed
+        .map(|managed| match managed {
+            ManagedFile::Binary { source_name, .. } => validated_artifact_digest(
+                &artifacts.binary_directory.join(source_name),
+                build_account,
+            ),
+            ManagedFile::Text { contents, .. } => Ok(bytes_digest(contents.as_bytes())),
+        })
+        .transpose()?;
+    let original_digest = match fs::symlink_metadata(destination) {
         Ok(metadata) => {
-            validate_installed_file(&destination, &metadata)?;
-            Some(file_digest(&destination)?)
+            validate_installed_file(destination, &metadata)?;
+            Some(file_digest(destination)?)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -617,7 +705,7 @@ fn plan_record(
         }
     };
     Ok(InstallationRecord {
-        destination,
+        destination: destination.to_path_buf(),
         staged,
         backup,
         original_digest,
@@ -629,7 +717,7 @@ fn stage_record(
     record: &InstallationRecord,
     artifacts: &BuildArtifacts,
     build_account: &UnixAccount,
-    managed: &ManagedFile,
+    managed: Option<&ManagedFile>,
 ) -> Result<()> {
     let stage_root = record
         .staged
@@ -652,19 +740,20 @@ fn stage_record(
         0o700,
     )?;
     match managed {
-        ManagedFile::Binary {
+        Some(ManagedFile::Binary {
             source_name, mode, ..
-        } => copy_build_artifact(
+        }) => copy_build_artifact(
             &artifacts.binary_directory.join(source_name),
             &record.staged,
             build_account,
             *mode,
         )?,
-        ManagedFile::Text { contents, mode, .. } => {
+        Some(ManagedFile::Text { contents, mode, .. }) => {
             write_root_file(&record.staged, contents.as_bytes(), *mode)?
         }
+        None => return Ok(()),
     }
-    if file_digest(&record.staged)? != record.new_digest {
+    if Some(file_digest(&record.staged)?) != record.new_digest {
         bail!("staged file changed while the installation was prepared");
     }
     sync_directory(
@@ -768,15 +857,27 @@ fn rollback_files(journal: &InstallationJournal) -> Result<()> {
     journal.validate(&journal.product)?;
     for record in journal.records.iter().rev() {
         if record.backup.exists() {
-            if record.destination.exists() {
-                validate_private_or_installed_regular_file(&record.destination)?;
-                if file_digest(&record.destination)? != record.new_digest {
+            if record.new_digest.is_some() {
+                if record.destination.exists() {
+                    validate_private_or_installed_regular_file(&record.destination)?;
+                    if Some(file_digest(&record.destination)?) != record.new_digest {
+                        bail!(
+                            "installed file changed before rollback: {}",
+                            record.destination.display()
+                        );
+                    }
+                    fs::remove_file(&record.destination)?;
+                } else if !record.staged.exists() {
                     bail!(
-                        "installed file changed before rollback: {}",
+                        "new managed destination disappeared before rollback: {}",
                         record.destination.display()
                     );
                 }
-                fs::remove_file(&record.destination)?;
+            } else if record.destination.exists() {
+                bail!(
+                    "removed managed destination reappeared before rollback: {}",
+                    record.destination.display()
+                );
             }
             fs::rename(&record.backup, &record.destination)?;
             sync_directory(
@@ -792,12 +893,12 @@ fn rollback_files(journal: &InstallationJournal) -> Result<()> {
                     record.destination.display()
                 );
             }
-        } else if record.original_digest.is_none()
+        } else if record.new_digest.is_some()
             && !record.staged.exists()
             && record.destination.exists()
         {
             validate_private_or_installed_regular_file(&record.destination)?;
-            if file_digest(&record.destination)? != record.new_digest {
+            if Some(file_digest(&record.destination)?) != record.new_digest {
                 bail!(
                     "new managed destination changed before rollback: {}",
                     record.destination.display()
@@ -810,6 +911,43 @@ fn rollback_files(journal: &InstallationJournal) -> Result<()> {
                     .parent()
                     .expect("validated destination has a parent"),
             )?;
+        } else if record.new_digest.is_none() && record.destination.exists() {
+            bail!(
+                "unexpected destination exists for an absent managed file: {}",
+                record.destination.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_committed_files(journal: &InstallationJournal) -> Result<()> {
+    for record in &journal.records {
+        match (
+            &record.new_digest,
+            fs::symlink_metadata(&record.destination),
+        ) {
+            (Some(expected), Ok(metadata)) => {
+                validate_installed_file(&record.destination, &metadata)?;
+                if file_digest(&record.destination)? != *expected {
+                    bail!(
+                        "accepted managed file changed before recovery: {}",
+                        record.destination.display()
+                    );
+                }
+            }
+            (Some(_), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                bail!(
+                    "accepted managed file disappeared before recovery: {}",
+                    record.destination.display()
+                );
+            }
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            (None, Ok(_)) => bail!(
+                "removed managed file reappeared before recovery: {}",
+                record.destination.display()
+            ),
+            (_, Err(error)) => return Err(error.into()),
         }
     }
     Ok(())
@@ -896,6 +1034,9 @@ async fn recover_uninstallation(product: &ManagedProduct) -> Result<()> {
                 &product.installation_manifest().enable_units,
                 &journal.previously_enabled,
                 true,
+                journal
+                    .previously_enabled
+                    .contains(&product.application_socket_name()),
             )
             .await?;
     }
@@ -1107,8 +1248,38 @@ fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all().map_err(Into::into)
+}
+
+fn managed_destination(managed: &ManagedFile) -> &Path {
+    match managed {
+        ManagedFile::Binary { destination, .. } | ManagedFile::Text { destination, .. } => {
+            destination
+        }
+    }
+}
+
+fn acquire_installation_lock(product: &ManagedProduct) -> Result<crate::InvocationLock> {
+    ensure_root_directory(Path::new(INSTALLATION_LOCK_ROOT), 0o700)?;
+    crate::acquire_named_in(
+        INSTALLATION_LOCK_ROOT,
+        &format!("installation-{}", product.name()),
+        false,
+    )
+    .context("failed to acquire product installation lock")
+}
+
+fn ensure_installation_state_directory(product: &ManagedProduct) -> Result<PathBuf> {
+    ensure_root_directory(Path::new("/var/lib/capulus"), 0o700)?;
+    ensure_root_directory(Path::new(INSTALLATION_STATE_ROOT), 0o700)?;
+    let state_directory = Path::new(INSTALLATION_STATE_ROOT).join(product.name());
+    ensure_root_directory(&state_directory, 0o700)?;
+    Ok(state_directory)
 }
 
 fn remove_private_file(path: &Path) -> Result<()> {
@@ -1136,6 +1307,7 @@ mod tests {
             target_enable_units: vec!["auc-agent.service".to_string()],
             previous_service_file: false,
             committed_records: 0,
+            accepted: false,
             records: vec![
                 InstallationRecord {
                     destination: PathBuf::from("/usr/local/bin/auc-agent"),
@@ -1146,7 +1318,7 @@ mod tests {
                         "/usr/local/bin/.capulus-auc-{job}/old/auc-agent"
                     )),
                     original_digest: None,
-                    new_digest: "00".repeat(32),
+                    new_digest: Some("00".repeat(32)),
                 },
                 InstallationRecord {
                     destination: PathBuf::from("/etc/systemd/system/auc-agent.service"),
@@ -1157,14 +1329,91 @@ mod tests {
                         "/etc/systemd/system/.capulus-auc-{job}/old/auc-agent.service"
                     )),
                     original_digest: None,
-                    new_digest: "11".repeat(32),
+                    new_digest: Some("11".repeat(32)),
                 },
             ],
         };
         journal.validate("auc").unwrap();
+        let bridge_json = serde_json::to_value(&journal).unwrap();
+        let bridge_fields = bridge_json.as_object().unwrap();
+        assert!(!bridge_fields.contains_key("accepted"));
+        assert!(!bridge_fields.contains_key("previous_application_socket_file"));
+        assert!(bridge_fields["records"][0]["new_digest"].as_str().is_some());
 
         let mut unsafe_journal = journal;
         unsafe_journal.records[0].backup = PathBuf::from("/tmp/auc-agent");
         assert!(unsafe_journal.validate("auc").is_err());
+    }
+
+    #[test]
+    fn accepted_installation_journal_requires_every_file_commit() {
+        let job = JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let mut journal = InstallationJournal {
+            product: "auc".to_string(),
+            job,
+            previously_enabled: Vec::new(),
+            target_enable_units: vec!["auc-agent.service".to_string()],
+            previous_service_file: false,
+            committed_records: 0,
+            accepted: true,
+            records: vec![InstallationRecord {
+                destination: PathBuf::from("/etc/systemd/system/auc-agent.service"),
+                staged: PathBuf::from(format!(
+                    "/etc/systemd/system/.capulus-auc-{job}/new/auc-agent.service"
+                )),
+                backup: PathBuf::from(format!(
+                    "/etc/systemd/system/.capulus-auc-{job}/old/auc-agent.service"
+                )),
+                original_digest: None,
+                new_digest: Some("00".repeat(32)),
+            }],
+        };
+
+        assert!(journal.validate("auc").is_err());
+        journal.committed_records = journal.records.len();
+        journal.validate("auc").unwrap();
+    }
+
+    #[test]
+    fn journal_accepts_a_transactional_managed_file_removal() {
+        let job = JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let journal = InstallationJournal {
+            product: "auc".to_string(),
+            job,
+            previously_enabled: vec![
+                "auc-agent.service".to_string(),
+                "auc-agent.socket".to_string(),
+            ],
+            target_enable_units: vec!["auc-agent.service".to_string()],
+            previous_service_file: true,
+            committed_records: 0,
+            accepted: false,
+            records: vec![
+                InstallationRecord {
+                    destination: PathBuf::from("/etc/systemd/system/auc-agent.service"),
+                    staged: PathBuf::from(format!(
+                        "/etc/systemd/system/.capulus-auc-{job}/new/auc-agent.service"
+                    )),
+                    backup: PathBuf::from(format!(
+                        "/etc/systemd/system/.capulus-auc-{job}/old/auc-agent.service"
+                    )),
+                    original_digest: Some("00".repeat(32)),
+                    new_digest: Some("11".repeat(32)),
+                },
+                InstallationRecord {
+                    destination: PathBuf::from("/etc/systemd/system/auc-agent.socket"),
+                    staged: PathBuf::from(format!(
+                        "/etc/systemd/system/.capulus-auc-{job}/new/auc-agent.socket"
+                    )),
+                    backup: PathBuf::from(format!(
+                        "/etc/systemd/system/.capulus-auc-{job}/old/auc-agent.socket"
+                    )),
+                    original_digest: Some("22".repeat(32)),
+                    new_digest: None,
+                },
+            ],
+        };
+
+        journal.validate("auc").unwrap();
     }
 }

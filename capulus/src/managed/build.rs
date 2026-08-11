@@ -1,6 +1,6 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::fs::{self, File};
+use std::io::{Read, Seek};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -8,17 +8,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::fs::{Gid, Uid, chown};
 use rustix::process::{Pid, Signal, kill_process_group};
 use sha2::{Digest, Sha256};
 
-use super::account::{ensure_owned_directory, require_root};
+use super::account::{SupplementaryGroups, ensure_owned_directory, require_root};
+use super::user_install::remove_orphaned_user_installations;
 use super::{BuildAccount, InstallationManifest, ManagedProduct, RedeployRequest, UnixAccount};
 
 const GLOBAL_BUILD_LOCK_ROOT: &str = "/run/capulus/locks";
 const GLOBAL_BUILD_LOCK_NAME: &str = "managed-build";
 const RUSTUP_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 const TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const RUSTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct ManagedBuild {
@@ -41,6 +42,8 @@ impl ManagedBuild {
             crate::acquire_named_in(GLOBAL_BUILD_LOCK_ROOT, GLOBAL_BUILD_LOCK_NAME, true)
                 .context("failed to acquire global Capulus build lock")?;
         let account = BuildAccount::ensure()?;
+        account.remove_orphaned_jobs()?;
+        remove_orphaned_user_installations()?;
         let job_root = account
             .jobs_home
             .join(format!("{}-{}", request.product, request.job));
@@ -145,16 +148,18 @@ impl ManagedBuild {
             let output_path = self
                 .job_root
                 .join(format!("{}-version.txt", binary.cargo_name));
-            let output = open_owned_output(&output_path, &self.account.account)?;
+            let mut output = self.account.account.create_file(&output_path, 0o600)?;
             let mut command =
                 self.build_account_command(artifacts.binary_directory.join(&binary.cargo_name));
-            command.arg("--version").stdout(Stdio::from(output));
+            command
+                .arg("--version")
+                .stdout(Stdio::from(output.try_clone()?));
             run_with_deadline(
                 &mut command,
                 Duration::from_secs(30),
                 "query staged binary version",
             )?;
-            let value = fs::read_to_string(&output_path)?;
+            let value = read_bounded_output(&mut output, 4096, "staged binary version")?;
             fs::remove_file(&output_path)?;
             if value.split_whitespace().last() != Some(expected.as_str()) {
                 bail!(
@@ -215,7 +220,7 @@ impl ManagedBuild {
         if hex_digest(&bytes) != expected {
             bail!("Rustup installer checksum does not match its published SHA-256");
         }
-        write_owned_file(&installer, &bytes, &self.account.account, 0o500)?;
+        self.account.account.write_file(&installer, &bytes, 0o500)?;
         let mut command = self.toolchain_command(&installer);
         command.args([
             "-y",
@@ -223,9 +228,9 @@ impl ManagedBuild {
             "minimal",
             "--no-modify-path",
             "--default-toolchain",
-            "stable",
+            "none",
         ]);
-        run_with_deadline(&mut command, TOOLCHAIN_TIMEOUT, "bootstrap Rustup")?;
+        run_with_deadline(&mut command, RUSTUP_BOOTSTRAP_TIMEOUT, "bootstrap Rustup")?;
         fs::remove_file(&installer).context("failed to remove Rustup bootstrap installer")
     }
 
@@ -233,26 +238,23 @@ impl ManagedBuild {
         let ca_path = self.cargo_home.join("registry-ca.pem");
         let configuration = self.request.release.registry.configuration(&ca_path)?;
         if let Some(credentials) = configuration.credentials {
-            write_owned_file(
+            self.account.account.write_file(
                 &self.cargo_home.join("credentials.toml"),
                 credentials.as_bytes(),
-                &self.account.account,
                 0o600,
             )?;
-            write_owned_file(
+            self.account.account.write_file(
                 &ca_path,
                 configuration
                     .ca_pem
                     .expect("private Cargo credentials always have a CA bundle")
                     .as_bytes(),
-                &self.account.account,
                 0o600,
             )?;
         }
-        write_owned_file(
+        self.account.account.write_file(
             &self.cargo_home.join("config.toml"),
             configuration.config.as_bytes(),
-            &self.account.account,
             0o600,
         )
     }
@@ -275,22 +277,20 @@ impl ManagedBuild {
             .ok_or_else(|| anyhow!("managed agent executable has no filename"))?;
         let staged_agent = self.install_root.join("bin").join(agent_name);
         let output_path = self.job_root.join("installation-manifest.json");
-        let output = open_owned_output(&output_path, &self.account.account)?;
+        let mut output = self.account.account.create_file(&output_path, 0o600)?;
         let mut command = self.build_account_command(&staged_agent);
         command.arg("installation-manifest");
-        command.stdout(Stdio::from(output));
+        command.stdout(Stdio::from(output.try_clone()?));
         run_with_deadline(
             &mut command,
             Duration::from_secs(30),
             "render staged installation manifest",
         )?;
-        let metadata = fs::metadata(&output_path)?;
-        if metadata.len() > 256 * 1024 {
-            bail!("staged installation manifest exceeds the safety limit");
-        }
-        let manifest = InstallationManifest::from_json(
-            &fs::read_to_string(&output_path).context("failed to read installation manifest")?,
-        )
+        let manifest = InstallationManifest::from_json(&read_bounded_output(
+            &mut output,
+            256 * 1024,
+            "staged installation manifest",
+        )?)
         .context("staged agent returned an invalid installation manifest")?;
         fs::remove_file(output_path).context("failed to remove staged installation manifest")?;
         product.validate_release_manifest(&manifest, &self.request.release.version)?;
@@ -306,13 +306,8 @@ impl ManagedBuild {
     }
 
     fn account_command(&self, program: impl AsRef<std::ffi::OsStr>, cargo_home: &Path) -> Command {
-        let mut command = account_command(program, &self.account.account);
-        command
-            .env("CARGO_HOME", cargo_home)
-            .env("RUSTUP_HOME", &self.account.rustup_home)
-            .env("CARGO_TARGET_DIR", &self.account.target_home)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+        let mut command = self.account.command(program, cargo_home);
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         command
     }
 }
@@ -379,8 +374,10 @@ impl BuildArtifacts {
         for binary in product.system_binaries() {
             let mut output =
                 tempfile::tempfile().context("failed to create version output file")?;
-            let mut command =
-                account_command(self.binary_directory.join(&binary.cargo_name), account);
+            let mut command = account.command(
+                self.binary_directory.join(&binary.cargo_name),
+                SupplementaryGroups::Initialize,
+            );
             command
                 .arg("--version")
                 .stdout(Stdio::from(output.try_clone()?))
@@ -403,32 +400,6 @@ impl BuildArtifacts {
         }
         Ok(())
     }
-}
-
-fn account_command(program: impl AsRef<std::ffi::OsStr>, account: &UnixAccount) -> Command {
-    let mut command = Command::new("/usr/bin/setpriv");
-    command
-        .env_clear()
-        .env("HOME", &account.home)
-        .env("USER", &account.name)
-        .env("LOGNAME", &account.name)
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        )
-        .env("LANG", "C.UTF-8")
-        .args([
-            format!("--reuid={}", account.uid),
-            format!("--regid={}", account.gid),
-            "--init-groups".to_string(),
-            "--reset-env".to_string(),
-            "--".to_string(),
-        ])
-        .arg(program)
-        .current_dir(&account.home)
-        .process_group(0)
-        .stdin(Stdio::null());
-    command
 }
 
 fn validate_local_artifact_directory(path: &Path, account: &UnixAccount) -> Result<()> {
@@ -472,32 +443,17 @@ fn rustup_target() -> Result<&'static str> {
     }
 }
 
-fn write_owned_file(path: &Path, bytes: &[u8], account: &UnixAccount, mode: u32) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    chown(
-        path,
-        Some(Uid::from_raw(account.uid)),
-        Some(Gid::from_raw(account.gid)),
-    )
-    .map_err(std::io::Error::from)?;
-    Ok(())
-}
-
-fn open_owned_output(path: &Path, account: &UnixAccount) -> Result<File> {
-    write_owned_file(path, &[], account, 0o600)?;
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))
+fn read_bounded_output(file: &mut File, limit: u64, description: &str) -> Result<String> {
+    if file.metadata()?.len() > limit {
+        bail!("{description} exceeds the {limit}-byte safety limit");
+    }
+    file.rewind()?;
+    let mut value = String::new();
+    file.take(limit + 1).read_to_string(&mut value)?;
+    if value.len() as u64 > limit {
+        bail!("{description} exceeds the {limit}-byte safety limit");
+    }
+    Ok(value)
 }
 
 pub(super) fn run_with_deadline(
@@ -505,6 +461,7 @@ pub(super) fn run_with_deadline(
     timeout: Duration,
     action: &str,
 ) -> Result<ExitStatus> {
+    command.process_group(0);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to {action}"))?;
@@ -522,9 +479,13 @@ pub(super) fn run_with_deadline(
         if started.elapsed() >= timeout {
             if let Some(pid) = Pid::from_raw(child.id() as i32) {
                 let _ = kill_process_group(pid, Signal::TERM);
-                thread::sleep(Duration::from_secs(2));
-                if child.try_wait()?.is_none() {
-                    let _ = kill_process_group(pid, Signal::KILL);
+                let termination_started = Instant::now();
+                while child.try_wait()?.is_none() {
+                    if termination_started.elapsed() >= Duration::from_secs(2) {
+                        let _ = kill_process_group(pid, Signal::KILL);
+                        break;
+                    }
+                    thread::sleep(COMMAND_POLL_INTERVAL);
                 }
             }
             let _ = child.wait();
@@ -572,5 +533,44 @@ mod tests {
         let debug = format!("{registry:?}");
         assert!(!debug.contains("very-secret-token"));
         assert!(!debug.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn deadline_terminates_the_complete_child_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo $! > \"$1\"; wait", "sh"])
+            .arg(&pid_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        assert!(
+            run_with_deadline(&mut command, Duration::from_millis(100), "run test child").is_err()
+        );
+        let pid = fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal zero only queries whether the numeric process ID still exists.
+            let exists = unsafe { libc::kill(pid, 0) } == 0;
+            if !exists {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                // SAFETY: the test created this still-live descendant and must not leak it.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                panic!("timed-out command left descendant PID {pid} alive");
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 }

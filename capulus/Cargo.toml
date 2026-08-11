@@ -1,9 +1,9 @@
 [package]
 name = "capulus"
-version = "0.4.6"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
-description = "Shared support helpers for komputation CLI tools."
+description = "Shared support for Rust command-line tools."
 repository.workspace = true
 readme = "README.md"
 

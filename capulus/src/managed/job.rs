@@ -1,7 +1,8 @@
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ use super::{
 const STATE_ROOT: &str = "/var/lib/capulus/jobs";
 const RUNTIME_ROOT: &str = "/run/capulus/jobs";
 const LOCK_ROOT: &str = "/run/capulus/locks";
+const TRANSIENT_START_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -70,23 +72,57 @@ impl RedeployCoordinator {
         })
     }
 
-    pub async fn schedule(
+    pub(super) fn authorize_redeploy(
         &self,
         peer: PeerCredentials,
-        release: ResolvedRelease,
         reinstall_requesting_user: bool,
+    ) -> Result<RedeployAuthorization> {
+        if peer.uid == 0 {
+            return Ok(RedeployAuthorization {
+                root: true,
+                required_user: None,
+            });
+        }
+        if !reinstall_requesting_user {
+            bail!("non-root redeploys must reinstall the requesting user's Cargo CLI");
+        }
+        let required_user =
+            UserInstallContext::capture(peer, &self.product.user_binary().cargo_name)?.ok_or_else(
+                || anyhow!("requesting user has no existing Cargo-installed managed CLI"),
+            )?;
+        Ok(RedeployAuthorization {
+            root: false,
+            required_user: Some(required_user),
+        })
+    }
+
+    pub(super) fn authorize_repair(&self, peer: PeerCredentials) -> Result<()> {
+        if peer.uid == 0 {
+            return Ok(());
+        }
+        UserInstallContext::capture(peer, &self.product.user_binary().cargo_name)?.ok_or_else(
+            || anyhow!("requesting user has no existing Cargo-installed managed CLI"),
+        )?;
+        Ok(())
+    }
+
+    pub(super) async fn schedule(
+        &self,
+        authorization: RedeployAuthorization,
+        release: ResolvedRelease,
     ) -> Result<RedeployOutcome> {
         release.validate()?;
-        let required_user = (reinstall_requesting_user && peer.uid != 0)
-            .then(|| UserInstallContext::capture(peer, &self.product.user_binary().cargo_name))
-            .transpose()?
-            .flatten();
+        if !authorization.root && release.version < *self.product.version() {
+            bail!("non-root callers cannot downgrade a managed system installation");
+        }
         let _lock = capulus_lock(self.product.name())?;
+        self.reconcile_active().await?;
         if let Some(active) = self.store.active()? {
             let status = self.store.status(active.job)?;
             if !status.phase.is_terminal() {
                 if active.version == release.version
-                    && active.required_uid == required_user.as_ref().map(|user| user.uid)
+                    && active.required_uid
+                        == authorization.required_user.as_ref().map(|user| user.uid)
                 {
                     return Ok(RedeployOutcome {
                         job: active.job,
@@ -110,7 +146,7 @@ impl RedeployCoordinator {
             product: self.product.name().to_string(),
             package: self.product.package().to_string(),
             release,
-            required_user,
+            required_user: authorization.required_user,
         };
         request.validate(&self.product)?;
         self.store.write_request(&request)?;
@@ -137,6 +173,13 @@ impl RedeployCoordinator {
         self.store.status(job)
     }
 
+    pub(super) async fn reconciled_status(&self, job: JobId) -> Result<RedeployJob> {
+        if self.store.active()?.is_some_and(|active| active.job == job) {
+            self.reconcile_active().await?;
+        }
+        self.store.status(job)
+    }
+
     pub fn active(&self) -> Result<Option<RedeployJob>> {
         self.store
             .active()?
@@ -144,10 +187,14 @@ impl RedeployCoordinator {
             .transpose()
     }
 
+    pub async fn reconciled_active(&self) -> Result<Option<RedeployJob>> {
+        self.reconcile_active().await?;
+        self.active()
+    }
+
     pub fn take_worker_request(&self, job: JobId) -> Result<RedeployRequest> {
-        let request = self.store.read_request(job)?;
+        let request = self.store.take_request(job)?;
         request.validate(&self.product)?;
-        self.store.remove_request(job)?;
         Ok(request)
     }
 
@@ -176,6 +223,62 @@ impl RedeployCoordinator {
     pub fn complete(&self, job: JobId, required_user_reinstalled: Option<bool>) -> Result<()> {
         self.store.complete(job, required_user_reinstalled)
     }
+
+    async fn reconcile_active(&self) -> Result<()> {
+        let Some(active) = self.store.active()? else {
+            return Ok(());
+        };
+        let status = self.store.status(active.job)?;
+        if status.phase.is_terminal() {
+            self.store.clear_active(active.job)?;
+            return Ok(());
+        }
+        if self
+            .systemd
+            .redeploy_is_active(&self.product, active.job)
+            .await?
+            || (status.phase == JobPhase::Queued
+                && self.store.request_is_within_start_grace(active.job)?)
+        {
+            return Ok(());
+        }
+        let Some(current) = self.store.active()? else {
+            return Ok(());
+        };
+        let status = self.store.status(current.job)?;
+        if current.job != active.job || status.phase.is_terminal() {
+            return Ok(());
+        }
+        self.store.fail(
+            active.job,
+            format!(
+                "transient redeploy unit {} stopped before recording a terminal outcome",
+                status.unit
+            ),
+            status.system_committed,
+            None,
+        )?;
+        self.store.remove_request(active.job)
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct RedeployAuthorization {
+    root: bool,
+    required_user: Option<UserInstallContext>,
+}
+
+impl RedeployAuthorization {
+    pub(super) fn validate_release(
+        &self,
+        product: &ManagedProduct,
+        release: &ResolvedRelease,
+    ) -> Result<()> {
+        if !self.root && release.version < *product.version() {
+            bail!("non-root callers cannot downgrade a managed system installation");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +298,7 @@ impl JobStore {
             state_directory: Path::new(STATE_ROOT).join(product),
             runtime_directory: Path::new(RUNTIME_ROOT).join(product),
         };
+        ensure_root_directory(Path::new("/var/lib/capulus"), 0o700)?;
         ensure_root_directory(Path::new(STATE_ROOT), 0o700)?;
         ensure_root_directory(Path::new(RUNTIME_ROOT), 0o700)?;
         ensure_root_directory(Path::new(LOCK_ROOT), 0o700)?;
@@ -267,10 +371,11 @@ impl JobStore {
             .context("failed to persist redeploy request")
     }
 
-    fn read_request(&self, job: JobId) -> Result<RedeployRequest> {
+    fn take_request(&self, job: JobId) -> Result<RedeployRequest> {
         let path = self.request_path(job);
         validate_private_root_file(&path)?;
-        let bytes = fs::read(path).context("failed to read redeploy request")?;
+        let bytes = fs::read(&path).context("failed to read redeploy request")?;
+        remove_file(&path)?;
         ciborium::from_reader(bytes.as_slice()).context("failed to decode redeploy request")
     }
 
@@ -305,7 +410,15 @@ impl JobStore {
             bail!("cannot fail terminal redeploy job {job}");
         }
         stored.status.phase = JobPhase::Failed;
-        stored.status.detail = bounded_detail(detail);
+        crate::store::atomic_write(
+            &self.diagnostic_path(job),
+            bounded_detail(detail).as_bytes(),
+            Some(0o600),
+            None,
+        )
+        .context("failed to persist private redeploy diagnostic")?;
+        stored.status.detail =
+            "managed redeploy failed; inspect the transient unit journal".to_string();
         stored.status.system_committed = system_committed;
         stored.status.rollback_succeeded = rollback_succeeded;
         write_json(&self.status_path(job), &stored, 0o600)?;
@@ -339,6 +452,20 @@ impl JobStore {
         Ok(())
     }
 
+    fn request_is_within_start_grace(&self, job: JobId) -> Result<bool> {
+        let path = self.request_path(job);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        validate_private_root_file_metadata(&path, &metadata)?;
+        Ok(metadata
+            .modified()?
+            .elapsed()
+            .is_ok_and(|age| age < TRANSIENT_START_GRACE))
+    }
+
     fn active_path(&self) -> PathBuf {
         self.state_directory.join("active.json")
     }
@@ -349,6 +476,10 @@ impl JobStore {
 
     fn request_path(&self, job: JobId) -> PathBuf {
         self.runtime_directory.join(format!("{job}.cbor"))
+    }
+
+    fn diagnostic_path(&self, job: JobId) -> PathBuf {
+        self.state_directory.join(format!("{job}.diagnostic"))
     }
 }
 
@@ -395,7 +526,7 @@ fn phase_rank(phase: &JobPhase) -> u8 {
 }
 
 fn capulus_lock(product: &str) -> Result<crate::InvocationLock> {
-    crate::acquire_named_in(LOCK_ROOT, &format!("{product}-schedule"), true)
+    crate::acquire_named_in(LOCK_ROOT, &format!("{product}-schedule"), false)
         .context("failed to acquire Capulus scheduling lock")
 }
 
@@ -436,6 +567,10 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 
 fn validate_private_root_file(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
+    validate_private_root_file_metadata(path, &metadata)
+}
+
+fn validate_private_root_file_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     if !metadata.file_type().is_file()
         || metadata.uid() != 0
         || metadata.gid() != 0
@@ -451,7 +586,9 @@ fn validate_private_root_file(path: &Path) -> Result<()> {
 
 fn remove_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => File::open(path.parent().expect("job file has a parent"))?
+            .sync_all()
+            .map_err(Into::into),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }

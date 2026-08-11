@@ -43,8 +43,8 @@ pub use job::{RedeployCoordinator, RedeployRequest};
 #[cfg(feature = "managed-system")]
 pub use product::{
     AgentServiceOptions, ApplicationSocketOptions, InstallationManifest, ManagedFile,
-    ManagedProduct, ManagedProductOptions, ProductValidationError, ServiceHardening, SocketOptions,
-    SystemBinary, UserBinary,
+    ManagedProduct, ManagedProductOptions, ManagedRedeployOptions, ProductValidationError,
+    ServiceHardening, SocketOptions, SystemBinary, UserBinary,
 };
 pub use protocol::{
     AgentInfo, ErrorCode, JobId, JobPhase, ManagementError, ManagementRequest, ManagementResponse,

@@ -117,6 +117,7 @@ pub fn atomic_write(
         if let Some(mode) = file_mode {
             tighten_file_permissions(path, mode)?;
         }
+        sync_directory(parent)?;
         return Ok(());
     }
     fs::write(path, bytes).with_context(|| format!("Failed to write {}", path.display()))?;
@@ -185,5 +186,17 @@ fn persist_temp_file(temp: NamedTempFile, path: &Path) -> Result<()> {
     temp.persist(path)
         .map_err(|err| err.error)
         .with_context(|| format!("Failed to move temporary file into {}", path.display()))?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("Failed to sync directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }

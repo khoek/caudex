@@ -11,7 +11,7 @@ use super::{
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
-const READINESS_RETRY: Duration = Duration::from_millis(250);
+const READINESS_RETRY: Duration = Duration::from_secs(1);
 
 pub struct RedeployWorker {
     product: Arc<ManagedProduct>,
@@ -134,27 +134,38 @@ impl RedeployWorker {
                 return Err(rollback_failure(&mut installation, error).await);
             }
             if let Err(error) = reinstall_user_cli(&self.product, job, &request.release, context) {
-                let finalize = installation.finalize();
-                return Err(WorkerFailure {
-                    error: match finalize {
-                        Ok(()) => error.context(
-                            "system redeploy succeeded but required user CLI reinstall failed",
+                let user_error = error
+                    .context("system redeploy succeeded but required user CLI reinstall failed");
+                return match installation.finalize() {
+                    Ok(()) => Err(WorkerFailure {
+                        error: user_error,
+                        system_committed: true,
+                        rollback_succeeded: None,
+                    }),
+                    Err(finalize) if installation.acceptance_committed() => Err(WorkerFailure {
+                        error: anyhow!(
+                            "{user_error:#}; committed installation cleanup failed: {finalize:#}"
                         ),
-                        Err(finalize) => anyhow!(
-                            "required user CLI reinstall failed: {error:#}; committed installation cleanup failed: {finalize:#}"
-                        ),
-                    },
-                    system_committed: true,
-                    rollback_succeeded: None,
-                });
+                        system_committed: true,
+                        rollback_succeeded: None,
+                    }),
+                    Err(finalize) => Err(rollback_failure(
+                        &mut installation,
+                        anyhow!("{user_error:#}; accepting the installation failed: {finalize:#}"),
+                    )
+                    .await),
+                };
             }
             Some(true)
         } else {
             None
         };
-        installation
-            .finalize()
-            .map_err(WorkerFailure::after_commit)?;
+        if let Err(error) = installation.finalize() {
+            if installation.acceptance_committed() {
+                return Err(WorkerFailure::after_commit(error));
+            }
+            return Err(rollback_failure(&mut installation, error).await);
+        }
         Ok(required_user_reinstalled)
     }
 
