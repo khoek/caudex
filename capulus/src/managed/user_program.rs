@@ -21,7 +21,7 @@ pub struct UserProgramUpdateOptions {
     pub cargo_binary: String,
     pub version: String,
     pub registry: Option<String>,
-    pub install_root: PathBuf,
+    pub cargo_root: PathBuf,
     pub timeout: Duration,
 }
 
@@ -32,7 +32,7 @@ impl Default for UserProgramUpdateOptions {
             cargo_binary: String::new(),
             version: String::new(),
             registry: None,
-            install_root: PathBuf::new(),
+            cargo_root: PathBuf::new(),
             timeout: Duration::from_secs(60 * 60),
         }
     }
@@ -56,16 +56,16 @@ impl UserProgramUpdateOptions {
         {
             bail!("user-program Cargo registry name is invalid");
         }
-        if !self.install_root.is_absolute()
-            || self.install_root == std::path::Path::new("/")
-            || self.install_root.components().any(|component| {
+        if !self.cargo_root.is_absolute()
+            || self.cargo_root == std::path::Path::new("/")
+            || self.cargo_root.components().any(|component| {
                 matches!(
                     component,
                     Component::ParentDir | Component::CurDir | Component::Prefix(_)
                 )
             })
         {
-            bail!("user-program Cargo install root must be a normalized absolute path");
+            bail!("user-program Cargo root must be a normalized absolute path");
         }
         if !(Duration::from_secs(60)..=Duration::from_secs(24 * 60 * 60)).contains(&self.timeout) {
             bail!("user-program update timeout must be between one minute and one day");
@@ -75,7 +75,7 @@ impl UserProgramUpdateOptions {
             cargo_binary: self.cargo_binary,
             version,
             registry: self.registry,
-            install_root: self.install_root,
+            cargo_root: self.cargo_root,
             timeout: self.timeout,
         })
     }
@@ -87,7 +87,7 @@ pub struct UserProgramUpdate {
     cargo_binary: String,
     version: Version,
     registry: Option<String>,
-    install_root: PathBuf,
+    cargo_root: PathBuf,
     timeout: Duration,
 }
 
@@ -95,7 +95,7 @@ impl UserProgramUpdate {
     pub fn is_current(&self) -> bool {
         let output = Command::new("/usr/bin/timeout")
             .args(["--signal=TERM", "--kill-after=2s", "10s"])
-            .arg(self.install_root.join("bin").join(&self.cargo_binary))
+            .arg(self.cargo_root.join("bin").join(&self.cargo_binary))
             .arg("--version")
             .stdin(Stdio::null())
             .output();
@@ -150,14 +150,14 @@ impl UserProgramUpdate {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new("cargo");
+        let mut command = Command::new(self.cargo_root.join("bin/cargo"));
         command
             .args(["install", "--locked", "--force", "--version"])
             .arg(self.version.to_string())
             .arg(&self.package)
             .args(["--bin", &self.cargo_binary])
             .arg("--root")
-            .arg(&self.install_root);
+            .arg(&self.cargo_root);
         if let Some(registry) = &self.registry {
             command.args(["--registry", registry]);
         }
@@ -169,7 +169,7 @@ impl UserProgramUpdate {
     }
 }
 
-pub fn current_user_cargo_install_root() -> Result<PathBuf> {
+pub fn current_user_cargo_root() -> Result<PathBuf> {
     if rustix::process::geteuid().is_root() {
         bail!("a user-program Cargo root cannot be resolved for root");
     }
@@ -209,12 +209,13 @@ mod tests {
             cargo_binary: "aegis".to_string(),
             version: "1.2.3".to_string(),
             registry: Some("hoek-deus".to_string()),
-            install_root: PathBuf::from("/home/example/.cargo"),
+            cargo_root: PathBuf::from("/home/example/.cargo"),
             ..UserProgramUpdateOptions::default()
         }
         .validate()
         .unwrap();
         let command = update.command();
+        assert_eq!(command.get_program(), "/home/example/.cargo/bin/cargo");
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -250,7 +251,7 @@ mod tests {
             package: "aegis-tool".to_string(),
             cargo_binary: "aegis".to_string(),
             version: "1.2.3".to_string(),
-            install_root: directory.path().to_path_buf(),
+            cargo_root: directory.path().to_path_buf(),
             ..UserProgramUpdateOptions::default()
         }
         .validate()

@@ -67,6 +67,4 @@ pub use server::{ManagementHandler, ManagementServer, ManagementServerOptions};
 #[cfg(feature = "managed-system")]
 use systemd::SystemdManager;
 #[cfg(feature = "managed-client")]
-pub use user_program::{
-    UserProgramUpdate, UserProgramUpdateOptions, current_user_cargo_install_root,
-};
+pub use user_program::{UserProgramUpdate, UserProgramUpdateOptions, current_user_cargo_root};
