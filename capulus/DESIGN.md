@@ -70,10 +70,12 @@ Connections, frames, request duration, concurrent handlers, and per-UID request 
 ## User program and privilege model
 
 User and system copies are deliberately independent installations of the same Cargo binary.
-Before requesting a system cutover, product client code may use `UserProgramUpdateOptions` to run:
+Before requesting a system cutover, product client code may use `UserProgramUpdateOptions` to run
+the validated Cargo program under the user's Cargo root with an explicit reusable target directory:
 
 ```text
-cargo install --locked --force --version VERSION PACKAGE --bin BINARY --root INSTALL_ROOT [--registry NAME]
+<cargo-root>/bin/cargo install --locked --force --version VERSION PACKAGE --bin BINARY \
+  --root <cargo-root> --target-dir <cargo-root>/target [--registry NAME]
 ```
 
 This helper refuses root, executes Cargo directly as the invoking user, has a validated deadline,

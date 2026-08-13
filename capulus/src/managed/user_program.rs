@@ -157,7 +157,9 @@ impl UserProgramUpdate {
             .arg(&self.package)
             .args(["--bin", &self.cargo_binary])
             .arg("--root")
-            .arg(&self.cargo_root);
+            .arg(&self.cargo_root)
+            .arg("--target-dir")
+            .arg(self.cargo_root.join("target"));
         if let Some(registry) = &self.registry {
             command.args(["--registry", registry]);
         }
@@ -233,6 +235,8 @@ mod tests {
                 "aegis",
                 "--root",
                 "/home/example/.cargo",
+                "--target-dir",
+                "/home/example/.cargo/target",
                 "--registry",
                 "hoek-deus",
             ]
