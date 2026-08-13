@@ -176,15 +176,12 @@ impl SystemdManager {
             .reload()
             .await
             .map_err(|source| operation("reload systemd units", source))?;
-        for socket in target_enable_units
-            .iter()
-            .filter(|unit| unit.ends_with(".socket"))
-        {
-            manager
-                .start_unit(socket, Mode::Replace)
-                .await
-                .map_err(|source| operation(format!("start {socket}"), source))?;
-        }
+        activate_sockets(
+            &manager,
+            target_enable_units,
+            socket_activation_for_cutover(cold_cutover),
+        )
+        .await?;
         if cold_cutover {
             manager
                 .start_unit(&product.service_name(), Mode::Replace)
@@ -256,15 +253,7 @@ impl SystemdManager {
             .await
             .map_err(|source| operation("reload restored systemd units", source))?;
         if previous_service_file {
-            for socket in previously_enabled
-                .iter()
-                .filter(|unit| unit.ends_with(".socket"))
-            {
-                manager
-                    .start_unit(socket, Mode::Replace)
-                    .await
-                    .map_err(|source| operation(format!("restore {socket}"), source))?;
-            }
+            activate_sockets(&manager, previously_enabled, SocketActivation::Restart).await?;
             manager
                 .restart_unit(&product.service_name(), Mode::Replace)
                 .await
@@ -317,6 +306,46 @@ fn managed_unit_names(product: &ManagedProduct) -> [String; 3] {
         product.application_socket_name(),
         product.management_socket_name(),
     ]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketActivation {
+    Start,
+    Restart,
+}
+
+fn socket_activation_for_cutover(cold_cutover: bool) -> SocketActivation {
+    if cold_cutover {
+        SocketActivation::Start
+    } else {
+        SocketActivation::Restart
+    }
+}
+
+async fn activate_sockets(
+    manager: &ManagerProxy<'_>,
+    units: &[String],
+    activation: SocketActivation,
+) -> Result<(), SystemdError> {
+    for socket in units.iter().filter(|unit| unit.ends_with(".socket")) {
+        let result = match activation {
+            SocketActivation::Start => manager.start_unit(socket, Mode::Replace).await,
+            SocketActivation::Restart => manager.restart_unit(socket, Mode::Replace).await,
+        };
+        result.map_err(|source| {
+            operation(
+                format!(
+                    "{} {socket}",
+                    match activation {
+                        SocketActivation::Start => "start",
+                        SocketActivation::Restart => "restart",
+                    }
+                ),
+                source,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 async fn stop_product_runtime(
@@ -579,5 +608,14 @@ mod tests {
         assert!(!missing_unit_error_name(
             "org.freedesktop.DBus.Error.AccessDenied"
         ));
+    }
+
+    #[test]
+    fn upgrades_recreate_live_socket_inodes_from_the_committed_units() {
+        assert_eq!(
+            socket_activation_for_cutover(false),
+            SocketActivation::Restart
+        );
+        assert_eq!(socket_activation_for_cutover(true), SocketActivation::Start);
     }
 }

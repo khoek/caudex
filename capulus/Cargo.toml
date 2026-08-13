@@ -1,6 +1,6 @@
 [package]
 name = "capulus"
-version = "0.6.1"
+version = "0.6.2"
 edition.workspace = true
 license.workspace = true
 description = "Shared support for Rust command-line tools."

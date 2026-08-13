@@ -145,7 +145,8 @@ staged replacements, and commit progress. Capulus:
 2. stages every replacement and removal;
 3. renames and fsyncs each destination while advancing the journal;
 4. runs `systemd-analyze verify` with a deadline;
-5. reloads units and restarts the service while retaining same-topology listeners; and
+5. reloads units, recreates same-topology listeners from their committed socket configuration, and
+   restarts the service; and
 6. accepts and cleans the transaction only after both protocols are healthy.
 
 Failure before acceptance rolls back files and prior unit enablement. Recovery resumes from the
