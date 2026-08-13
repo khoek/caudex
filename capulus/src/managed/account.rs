@@ -7,23 +7,21 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::JobId;
+use super::validation::is_valid_identifier;
 use anyhow::{Context, Result, anyhow, bail};
 use rustix::fs::{
     AtFlags, Gid, Mode, OFlags, RawDir, Uid, chmodat, fchmod, fchown, mkdirat, openat,
 };
-use serde::{Deserialize, Serialize};
 
-use super::product::is_valid_identifier;
-use super::{JobId, PeerCredentials};
-
-pub const BUILD_USER: &str = "capulus-build";
-pub const BUILD_GROUP: &str = "capulus-build";
-pub const BUILD_HOME: &str = "/var/lib/capulus-build";
-pub const BUILD_CARGO_TOOLS_HOME: &str = "/var/lib/capulus-build/cargo-tools";
-pub const BUILD_RUSTUP_HOME: &str = "/var/lib/capulus-build/rustup";
-pub const BUILD_CACHE_HOME: &str = "/var/lib/capulus-build/cache";
-pub const BUILD_TARGET_HOME: &str = "/var/lib/capulus-build/target";
-pub const BUILD_JOBS_HOME: &str = "/var/lib/capulus-build/jobs";
+const BUILD_USER: &str = "capulus-build";
+const BUILD_GROUP: &str = "capulus-build";
+const BUILD_HOME: &str = "/var/lib/capulus-build";
+const BUILD_CARGO_TOOLS_HOME: &str = "/var/lib/capulus-build/cargo-tools";
+const BUILD_RUSTUP_HOME: &str = "/var/lib/capulus-build/rustup";
+const BUILD_CACHE_HOME: &str = "/var/lib/capulus-build/cache";
+const BUILD_TARGET_HOME: &str = "/var/lib/capulus-build/target";
+const BUILD_JOBS_HOME: &str = "/var/lib/capulus-build/jobs";
 const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,8 +43,38 @@ impl UnixAccount {
         lookup_passwd(0, Some(&name))
     }
 
+    pub fn is_member_of(&self, group: &str) -> Result<bool> {
+        let group_id =
+            group_gid(group)?.ok_or_else(|| anyhow!("NSS group {group:?} does not exist"))?;
+        if self.gid == group_id {
+            return Ok(true);
+        }
+        let name =
+            CString::new(self.name.as_str()).context("NSS account name contains a NUL byte")?;
+        let mut count = 0;
+        // SAFETY: this first call requests the required group count and writes no group IDs.
+        unsafe {
+            libc::getgrouplist(name.as_ptr(), self.gid, std::ptr::null_mut(), &mut count);
+        }
+        if count <= 0 {
+            return Ok(false);
+        }
+        let mut groups = vec![0; count as usize];
+        // SAFETY: `groups` has the capacity reported by the preceding call and `name` is NUL-terminated.
+        let result =
+            unsafe { libc::getgrouplist(name.as_ptr(), self.gid, groups.as_mut_ptr(), &mut count) };
+        if result < 0 {
+            bail!(
+                "NSS supplementary group list changed while resolving {}",
+                self.name
+            );
+        }
+        groups.truncate(count as usize);
+        Ok(groups.contains(&group_id))
+    }
+
     pub fn validate_interactive(&self) -> Result<()> {
-        if self.uid == 0 || self.uid < login_uid_min()? {
+        if self.uid == 0 || self.uid < login_id_min("UID_MIN")? {
             bail!("UID {} is a root or system account", self.uid);
         }
         validate_absolute_normal_path(&self.home)?;
@@ -60,11 +88,7 @@ impl UnixAccount {
         Ok(())
     }
 
-    pub(super) fn command(
-        &self,
-        program: impl AsRef<OsStr>,
-        supplementary_groups: SupplementaryGroups,
-    ) -> Command {
+    pub(super) fn command(&self, program: impl AsRef<OsStr>) -> Command {
         let mut command = Command::new("/usr/bin/setpriv");
         command
             .env_clear()
@@ -77,7 +101,7 @@ impl UnixAccount {
             .args([
                 format!("--reuid={}", self.uid),
                 format!("--regid={}", self.gid),
-                supplementary_groups.setpriv_argument().to_string(),
+                "--clear-groups".to_string(),
                 "--".to_string(),
             ])
             .arg(program)
@@ -126,29 +150,14 @@ impl UnixAccount {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SupplementaryGroups {
-    Initialize,
-    Clear,
-}
-
-impl SupplementaryGroups {
-    fn setpriv_argument(self) -> &'static str {
-        match self {
-            Self::Initialize => "--init-groups",
-            Self::Clear => "--clear-groups",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
-pub struct BuildAccount {
-    pub account: UnixAccount,
-    pub cargo_tools_home: PathBuf,
-    pub rustup_home: PathBuf,
-    pub cache_home: PathBuf,
-    pub target_home: PathBuf,
-    pub jobs_home: PathBuf,
+pub(super) struct BuildAccount {
+    pub(super) account: UnixAccount,
+    pub(super) cargo_tools_home: PathBuf,
+    pub(super) rustup_home: PathBuf,
+    pub(super) cache_home: PathBuf,
+    pub(super) target_home: PathBuf,
+    pub(super) jobs_home: PathBuf,
 }
 
 impl BuildAccount {
@@ -200,7 +209,7 @@ impl DirectoryOwner {
 }
 
 impl BuildAccount {
-    pub fn ensure() -> Result<Self> {
+    pub(super) fn ensure() -> Result<Self> {
         require_root()?;
         if UnixAccount::by_name(BUILD_USER)?.is_none() {
             ensure_build_group()?;
@@ -255,7 +264,7 @@ impl BuildAccount {
             set_directory_mode_and_sync(
                 &home,
                 0o711,
-                "failed to finish the Capulus build-home migration",
+                "failed to finish creating the Capulus build home",
             )?;
         }
         Ok(())
@@ -282,21 +291,10 @@ impl BuildAccount {
             .sync_all()?;
             BoundaryState::OwnershipSecured
         } else {
-            match BoundaryState::classify(
+            BoundaryState::classify(
                 DirectoryIdentity::from_metadata(&directory.metadata()?),
-                DirectoryOwner::of(&self.account),
                 boundary_owner,
-            )? {
-                BoundaryState::PriorLayout => {
-                    set_directory_owner_and_sync(
-                        &directory,
-                        boundary_owner,
-                        "failed to secure ownership of the Capulus build home",
-                    )?;
-                    BoundaryState::OwnershipSecured
-                }
-                state => state,
-            }
+            )?
         };
         Ok((directory, state))
     }
@@ -327,7 +325,14 @@ impl BuildAccount {
                         entry.path().display()
                     )
                 })? {
-                    PrivateDirectoryState::Current => {}
+                    PrivateDirectoryState::Current => {
+                        if home_state == BoundaryState::OwnershipSecured {
+                            require_empty_directory(
+                                &open_real_directory(&entry.path())?,
+                                &entry.path(),
+                            )?;
+                        }
+                    }
                     PrivateDirectoryState::CreationInterrupted => {
                         require_empty_directory(
                             &open_real_directory(&entry.path())?,
@@ -340,28 +345,16 @@ impl BuildAccount {
                 let jobs_state = if creation_restricted {
                     BoundaryState::OwnershipSecured
                 } else {
-                    BoundaryState::classify(
-                        identity,
-                        DirectoryOwner::of(&self.account),
-                        boundary_owner,
-                    )
-                    .with_context(|| {
+                    BoundaryState::classify(identity, boundary_owner).with_context(|| {
                         format!(
                             "Capulus build jobs directory has invalid type, ownership, or mode: {}",
                             entry.path().display()
                         )
                     })?
                 };
-                if home_state == BoundaryState::Current && jobs_state == BoundaryState::PriorLayout
-                {
-                    bail!(
-                        "Capulus current build home contains a prior-layout jobs directory: {}",
-                        entry.path().display()
-                    );
-                }
                 if creation_restricted
-                    || (home_state == BoundaryState::Current
-                        && jobs_state == BoundaryState::OwnershipSecured)
+                    || home_state == BoundaryState::OwnershipSecured
+                    || jobs_state == BoundaryState::OwnershipSecured
                 {
                     require_empty_directory(&open_real_directory(&entry.path())?, &entry.path())?;
                 }
@@ -409,7 +402,7 @@ impl BuildAccount {
         let (directory, initializing) =
             open_or_create_restricted_directory(&self.jobs_home, boundary_owner)
                 .context("failed to open or create the Capulus build jobs directory")?;
-        let mut state = if initializing {
+        let state = if initializing {
             set_directory_owner_and_sync(
                 &directory,
                 boundary_owner,
@@ -419,80 +412,36 @@ impl BuildAccount {
         } else {
             BoundaryState::classify(
                 DirectoryIdentity::from_metadata(&directory.metadata()?),
-                DirectoryOwner::of(&self.account),
                 boundary_owner,
             )?
         };
-        if home_state == BoundaryState::Current && state == BoundaryState::PriorLayout {
-            bail!("Capulus current build home contains a prior-layout jobs directory");
-        }
-        if home_state == BoundaryState::Current && state == BoundaryState::OwnershipSecured {
+        if home_state == BoundaryState::OwnershipSecured || state == BoundaryState::OwnershipSecured
+        {
             require_empty_directory(&directory, &self.jobs_home)?;
-        }
-        if state == BoundaryState::PriorLayout {
-            set_directory_owner_and_sync(
-                &directory,
-                boundary_owner,
-                "failed to secure ownership of the Capulus build jobs directory",
-            )?;
-            state = BoundaryState::OwnershipSecured;
         }
         if state == BoundaryState::OwnershipSecured {
             set_directory_mode_and_sync(
                 &directory,
                 0o711,
-                "failed to finish the Capulus build-jobs migration",
+                "failed to finish creating the Capulus build jobs directory",
             )?;
         }
         Ok(())
     }
 
-    pub fn cargo(&self) -> PathBuf {
+    pub(super) fn cargo(&self) -> PathBuf {
         self.cargo_tools_home.join("bin/cargo")
     }
 
-    pub fn rustup(&self) -> PathBuf {
+    pub(super) fn rustup(&self) -> PathBuf {
         self.cargo_tools_home.join("bin/rustup")
-    }
-
-    pub(super) fn reclaim_target_home(&self) -> Result<()> {
-        require_root()?;
-        self.reclaim_target_home_with(DirectoryOwner::ROOT)
-    }
-
-    fn reclaim_target_home_with(&self, boundary_owner: DirectoryOwner) -> Result<()> {
-        let home_path = self.home()?;
-        let home = open_real_directory(home_path)?;
-        if !DirectoryIdentity::from_metadata(&home.metadata()?)
-            .is_owned_directory(boundary_owner, 0o711)
-        {
-            bail!("Capulus cannot reclaim a target outside its current build-home boundary");
-        }
-        let target = open_directory_at(&home, OsStr::new("target"))?;
-        if !DirectoryIdentity::from_metadata(&target.metadata()?)
-            .is_owned_directory(DirectoryOwner::of(&self.account), 0o700)
-        {
-            bail!("Capulus build target ownership or mode changed before reclamation");
-        }
-        fs::remove_dir_all(&self.target_home)
-            .context("failed to reclaim the shared build target")?;
-        home.sync_all()?;
-        self.ensure_private_directory(&self.target_home, boundary_owner)?;
-        home.sync_all()?;
-        let target = open_directory_at(&home, OsStr::new("target"))?;
-        if !DirectoryIdentity::from_metadata(&target.metadata()?)
-            .is_owned_directory(DirectoryOwner::of(&self.account), 0o700)
-        {
-            bail!("Capulus did not recreate its shared build target securely");
-        }
-        Ok(())
     }
 
     pub(super) fn command(&self, program: impl AsRef<OsStr>, cargo_home: &Path) -> Command {
         let mut path = self.cargo_tools_home.join("bin").into_os_string();
         path.push(":");
         path.push(SYSTEM_PATH);
-        let mut command = self.account.command(program, SupplementaryGroups::Clear);
+        let mut command = self.account.command(program);
         command
             .env("CARGO_HOME", cargo_home)
             .env("RUSTUP_HOME", &self.rustup_home)
@@ -556,10 +505,6 @@ impl DirectoryIdentity {
         self.is_directory && self.mode == mode
     }
 
-    pub(super) fn is_directory_owned_by_other_uid(self, owner: DirectoryOwner, mode: u32) -> bool {
-        self.is_directory_with_mode(mode) && self.uid != owner.uid
-    }
-
     fn is_restricted_creation(self, owner: DirectoryOwner) -> bool {
         self.is_restricted(owner, 0o700)
     }
@@ -576,26 +521,17 @@ impl DirectoryIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundaryState {
     Current,
-    PriorLayout,
     OwnershipSecured,
 }
 
 impl BoundaryState {
-    fn classify(
-        identity: DirectoryIdentity,
-        prior_owner: DirectoryOwner,
-        current_owner: DirectoryOwner,
-    ) -> Result<Self> {
-        if identity.is_owned_directory(current_owner, 0o711) {
+    fn classify(identity: DirectoryIdentity, owner: DirectoryOwner) -> Result<Self> {
+        if identity.is_owned_directory(owner, 0o711) {
             Ok(Self::Current)
-        } else if identity.is_owned_directory(prior_owner, 0o700) {
-            Ok(Self::PriorLayout)
-        } else if identity.is_owned_directory(current_owner, 0o700) {
+        } else if identity.is_owned_directory(owner, 0o700) {
             Ok(Self::OwnershipSecured)
         } else {
-            bail!(
-                "Capulus build boundary is neither current, an exact prior layout, nor an interrupted migration"
-            )
+            bail!("Capulus build boundary is neither current nor an empty interrupted creation")
         }
     }
 }
@@ -621,102 +557,6 @@ impl PrivateDirectoryState {
         } else {
             bail!("Capulus private build directory is neither current nor an interrupted creation")
         }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct UserInstallContext {
-    pub account_name: String,
-    pub uid: u32,
-    pub gid: u32,
-    pub home: PathBuf,
-    pub cargo_home: PathBuf,
-    pub rustup_home: PathBuf,
-    pub cargo: PathBuf,
-    pub rustup: PathBuf,
-    pub installed_binary: PathBuf,
-}
-
-impl UserInstallContext {
-    pub fn capture(peer: PeerCredentials, binary_name: &str) -> Result<Option<Self>> {
-        let account = UnixAccount::by_uid(peer.uid)?;
-        account.validate_interactive()?;
-        validate_peer_process(peer, &account)?;
-        let environment = read_process_environment(peer.pid)?;
-        let cargo_home = environment_path(&environment, b"CARGO_HOME")
-            .unwrap_or_else(|| account.home.join(".cargo"));
-        let rustup_home = environment_path(&environment, b"RUSTUP_HOME")
-            .unwrap_or_else(|| account.home.join(".rustup"));
-        for path in [&cargo_home, &rustup_home] {
-            validate_absolute_normal_path(path)?;
-            if !path.starts_with(&account.home) {
-                bail!(
-                    "caller Cargo/Rustup path is outside its NSS home: {}",
-                    path.display()
-                );
-            }
-        }
-        let installed_binary = cargo_home.join("bin").join(binary_name);
-        if !owned_executable_regular_file(&installed_binary, account.uid)? {
-            return Ok(None);
-        }
-        let cargo = cargo_home.join("bin/cargo");
-        let rustup = cargo_home.join("bin/rustup");
-        if !owned_executable_regular_file(&rustup, account.uid)? {
-            bail!(
-                "existing user CLI has no valid Rustup executable at {}",
-                rustup.display()
-            );
-        }
-        if !owned_cargo_executable(&cargo, &rustup, account.uid)? {
-            bail!(
-                "existing user CLI has no valid Cargo executable at {}",
-                cargo.display()
-            );
-        }
-        Ok(Some(Self {
-            account_name: account.name,
-            uid: account.uid,
-            gid: account.gid,
-            home: account.home,
-            cargo_home,
-            rustup_home,
-            cargo,
-            rustup,
-            installed_binary,
-        }))
-    }
-
-    pub fn revalidate(&self, binary_name: &str) -> Result<UnixAccount> {
-        let account = UnixAccount::by_uid(self.uid)?;
-        account.validate_interactive()?;
-        if account.name != self.account_name
-            || account.gid != self.gid
-            || account.home != self.home
-            || self.installed_binary != self.cargo_home.join("bin").join(binary_name)
-        {
-            bail!("requesting user's NSS or Cargo identity changed during redeploy");
-        }
-        for path in [
-            &self.cargo_home,
-            &self.rustup_home,
-            &self.cargo,
-            &self.rustup,
-            &self.installed_binary,
-        ] {
-            validate_absolute_normal_path(path)?;
-            if !path.starts_with(&self.home) {
-                bail!("requesting user's validated path escaped its NSS home");
-            }
-        }
-        if !owned_executable_regular_file(&self.rustup, self.uid)?
-            || !owned_cargo_executable(&self.cargo, &self.rustup, self.uid)?
-            || !owned_executable_regular_file(&self.installed_binary, self.uid)?
-        {
-            bail!("requesting user's Cargo installation changed during redeploy");
-        }
-        Ok(account)
     }
 }
 
@@ -845,17 +685,6 @@ pub(super) fn open_directory_at(parent: &File, name: &OsStr) -> Result<File> {
         parent,
         name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(|error| std::io::Error::from(error).into())
-}
-
-pub(super) fn open_file_at(parent: &File, name: &OsStr) -> Result<File> {
-    openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map(File::from)
@@ -1042,10 +871,6 @@ fn passwd_buffer_len() -> usize {
     }
 }
 
-fn login_uid_min() -> Result<u32> {
-    login_id_min("UID_MIN")
-}
-
 fn login_id_min(name: &str) -> Result<u32> {
     let contents =
         fs::read_to_string("/etc/login.defs").context("failed to read /etc/login.defs")?;
@@ -1063,41 +888,6 @@ fn login_id_min(name: &str) -> Result<u32> {
     bail!("/etc/login.defs does not define {name}")
 }
 
-fn validate_peer_process(peer: PeerCredentials, account: &UnixAccount) -> Result<()> {
-    let status_path = Path::new("/proc").join(peer.pid.to_string()).join("status");
-    let status = fs::read_to_string(&status_path).with_context(|| {
-        format!(
-            "failed to inspect management caller at {}",
-            status_path.display()
-        )
-    })?;
-    let uid = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| anyhow!("caller process status omitted effective UID"))?
-        .parse::<u32>()
-        .context("caller process effective UID is invalid")?;
-    if uid != peer.uid || account.uid != peer.uid {
-        bail!("management caller process credentials changed during request capture");
-    }
-    Ok(())
-}
-
-fn read_process_environment(pid: u32) -> Result<Vec<u8>> {
-    let path = Path::new("/proc").join(pid.to_string()).join("environ");
-    fs::read(&path)
-        .with_context(|| format!("failed to read caller environment at {}", path.display()))
-}
-
-fn environment_path(environment: &[u8], name: &[u8]) -> Option<PathBuf> {
-    environment
-        .split(|byte| *byte == 0)
-        .find_map(|entry| entry.strip_prefix(name)?.strip_prefix(b"="))
-        .filter(|value| !value.is_empty())
-        .map(|value| PathBuf::from(std::ffi::OsStr::from_bytes(value)))
-}
-
 fn validate_absolute_normal_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || path.components().any(|component| {
@@ -1110,36 +900,6 @@ fn validate_absolute_normal_path(path: &Path) -> Result<()> {
         bail!("path must be absolute and normalized: {}", path.display());
     }
     Ok(())
-}
-
-fn owned_executable_regular_file(path: &Path, uid: u32) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_file()
-            && metadata.uid() == uid
-            && metadata.permissions().mode() & 0o111 != 0),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-fn owned_cargo_executable(path: &Path, rustup: &Path, uid: u32) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    };
-    if metadata.file_type().is_file() {
-        return Ok(metadata.uid() == uid && metadata.permissions().mode() & 0o111 != 0);
-    }
-    if !metadata.file_type().is_symlink() || metadata.uid() != uid {
-        return Ok(false);
-    }
-    Ok(fs::read_link(path)? == Path::new("rustup")
-        && path.parent() == rustup.parent()
-        && rustup.file_name().is_some_and(|name| name == "rustup")
-        && owned_executable_regular_file(rustup, uid)?)
 }
 
 #[cfg(test)]
@@ -1168,44 +928,9 @@ mod tests {
     }
 
     #[test]
-    fn process_environment_parser_is_binary_safe() {
-        let environment = b"HOME=/home/example\0CARGO_HOME=/srv/cargo space\0EMPTY=\0";
-        assert_eq!(
-            environment_path(environment, b"CARGO_HOME"),
-            Some(PathBuf::from("/srv/cargo space"))
-        );
-        assert_eq!(environment_path(environment, b"EMPTY"), None);
-    }
-
-    #[test]
-    fn normalized_path_validation_rejects_traversal() {
-        assert!(validate_absolute_normal_path(Path::new("/home/user/.cargo")).is_ok());
-        assert!(validate_absolute_normal_path(Path::new("/home/user/../root")).is_err());
-        assert!(validate_absolute_normal_path(Path::new("relative")).is_err());
-    }
-
-    #[test]
-    fn standard_rustup_cargo_proxy_is_validated_without_following_arbitrary_links() {
-        use std::os::unix::fs::symlink;
-
-        let directory = tempfile::tempdir().unwrap();
-        let rustup = directory.path().join("rustup");
-        fs::write(&rustup, b"proxy").unwrap();
-        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o700)).unwrap();
-        let cargo = directory.path().join("cargo");
-        symlink("rustup", &cargo).unwrap();
-        let uid = rustix::process::geteuid().as_raw();
-
-        assert!(owned_cargo_executable(&cargo, &rustup, uid).unwrap());
-        fs::remove_file(&cargo).unwrap();
-        symlink("/bin/sh", &cargo).unwrap();
-        assert!(!owned_cargo_executable(&cargo, &rustup, uid).unwrap());
-    }
-
-    #[test]
     fn account_command_uses_one_exact_setpriv_boundary() {
         let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
-        let command = account.command("/bin/true", SupplementaryGroups::Initialize);
+        let command = account.command("/bin/true");
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -1214,7 +939,7 @@ mod tests {
         assert_eq!(command.get_program(), OsStr::new("/usr/bin/setpriv"));
         assert!(arguments.contains(&format!("--reuid={}", account.uid)));
         assert!(arguments.contains(&format!("--regid={}", account.gid)));
-        assert!(arguments.contains(&"--init-groups".to_string()));
+        assert!(arguments.contains(&"--clear-groups".to_string()));
         assert!(!arguments.contains(&"--reset-env".to_string()));
         assert_eq!(command.get_current_dir(), Some(account.home.as_path()));
         assert_eq!(
@@ -1227,29 +952,26 @@ mod tests {
     }
 
     #[test]
-    fn build_boundaries_accept_only_current_prior_and_interrupted_states() {
-        let prior_owner = DirectoryOwner { uid: 997, gid: 973 };
+    fn build_boundaries_accept_only_current_and_interrupted_states() {
+        let build_owner = DirectoryOwner { uid: 997, gid: 973 };
         assert_eq!(
-            classify_test_boundary(0, 0, 0o711, prior_owner).unwrap(),
+            classify_test_boundary(0, 0, 0o711).unwrap(),
             BoundaryState::Current
         );
         assert_eq!(
-            classify_test_boundary(prior_owner.uid, prior_owner.gid, 0o700, prior_owner).unwrap(),
-            BoundaryState::PriorLayout
-        );
-        assert_eq!(
-            classify_test_boundary(0, 0, 0o700, prior_owner).unwrap(),
+            classify_test_boundary(0, 0, 0o700).unwrap(),
             BoundaryState::OwnershipSecured
         );
+        assert!(classify_test_boundary(build_owner.uid, build_owner.gid, 0o700).is_err());
         assert_eq!(
             PrivateDirectoryState::classify(
                 DirectoryIdentity {
                     is_directory: true,
-                    uid: prior_owner.uid,
-                    gid: prior_owner.gid,
+                    uid: build_owner.uid,
+                    gid: build_owner.gid,
                     mode: 0o700,
                 },
-                prior_owner,
+                build_owner,
                 DirectoryOwner::ROOT,
             )
             .unwrap(),
@@ -1263,7 +985,7 @@ mod tests {
                     gid: 0,
                     mode: 0o700,
                 },
-                prior_owner,
+                build_owner,
                 DirectoryOwner::ROOT,
             )
             .unwrap(),
@@ -1295,8 +1017,8 @@ mod tests {
             (false, 0, 0, 0o711),
             (true, 0, 0, 0o755),
             (true, 0, 0, 0o701),
-            (true, prior_owner.uid, prior_owner.gid, 0o711),
-            (true, 1234, prior_owner.gid, 0o700),
+            (true, build_owner.uid, build_owner.gid, 0o711),
+            (true, 1234, build_owner.gid, 0o700),
         ] {
             assert!(
                 BoundaryState::classify(
@@ -1306,7 +1028,6 @@ mod tests {
                         gid,
                         mode,
                     },
-                    prior_owner,
                     DirectoryOwner::ROOT,
                 )
                 .is_err()
@@ -1327,30 +1048,24 @@ mod tests {
     }
 
     #[test]
-    fn prior_layout_is_migrated_once_without_replacing_directories() {
+    fn nonempty_interrupted_layout_is_rejected_without_mutation() {
         let temporary = tempfile::tempdir().unwrap();
         let build = test_build(temporary.path().join("capulus-build"));
         create_layout(&build, 0o700, 0o700);
-        fs::write(build.cache_home.join("preserved"), b"cache").unwrap();
-        fs::write(build.jobs_home.join("preserved"), b"job").unwrap();
+        fs::write(build.cache_home.join("legacy-cache"), b"cache").unwrap();
         let inodes = layout_inodes(&build);
 
-        build.ensure_layout().unwrap();
-        assert_current_layout(&build);
+        assert!(build.ensure_layout().is_err());
+        assert_mode(&build.home, 0o700);
+        assert_eq!(layout_inodes(&build), inodes);
         assert_eq!(
-            fs::read(build.cache_home.join("preserved")).unwrap(),
+            fs::read(build.cache_home.join("legacy-cache")).unwrap(),
             b"cache"
         );
-        assert_eq!(fs::read(build.jobs_home.join("preserved")).unwrap(), b"job");
-        assert_eq!(layout_inodes(&build), inodes);
-
-        build.ensure_layout().unwrap();
-        assert_current_layout(&build);
-        assert_eq!(layout_inodes(&build), inodes);
     }
 
     #[test]
-    fn migration_resumes_after_each_jobs_boundary_transition() {
+    fn empty_interrupted_creation_resumes_after_each_jobs_boundary_transition() {
         let temporary = tempfile::tempdir().unwrap();
         for (name, jobs_mode) in [("jobs-ownership-secured", 0o700), ("jobs-current", 0o711)] {
             let build = test_build(temporary.path().join(name));
@@ -1507,11 +1222,6 @@ mod tests {
         assert!(build.ensure_layout().is_err());
         assert_mode(&build.home, 0o700);
 
-        let build = test_build(temporary.path().join("prior-jobs-in-current-home"));
-        create_layout(&build, 0o711, 0o700);
-        assert!(build.ensure_layout().is_err());
-        assert_mode(&build.jobs_home, 0o700);
-
         let build = test_build(temporary.path().join("nonempty-current-jobs-creation"));
         create_layout(&build, 0o711, 0o700);
         set_test_owner(&build.jobs_home, build.boundary_owner);
@@ -1526,56 +1236,7 @@ mod tests {
         assert_mode(&build.jobs_home, 0o755);
     }
 
-    #[test]
-    fn target_reclamation_preserves_caches_and_recreates_an_exact_empty_target() {
-        let temporary = tempfile::tempdir().unwrap();
-        let build = test_build(temporary.path().join("capulus-build"));
-        create_layout(&build, 0o711, 0o711);
-        fs::create_dir(build.target_home.join("debug")).unwrap();
-        fs::write(build.target_home.join("debug/artifact"), b"large target").unwrap();
-        fs::write(build.cache_home.join("registry-index"), b"preserve cache").unwrap();
-        let old_target = open_real_directory(&build.target_home).unwrap();
-        let old_inode = old_target.metadata().unwrap().ino();
-
-        build
-            .build
-            .reclaim_target_home_with(build.boundary_owner)
-            .unwrap();
-
-        assert_owned_mode(
-            &build.target_home,
-            DirectoryOwner::of(&build.account),
-            0o700,
-        );
-        assert_ne!(
-            fs::symlink_metadata(&build.target_home).unwrap().ino(),
-            old_inode
-        );
-        assert!(fs::read_dir(&build.target_home).unwrap().next().is_none());
-        assert_eq!(
-            fs::read(build.cache_home.join("registry-index")).unwrap(),
-            b"preserve cache"
-        );
-
-        fs::remove_dir(&build.target_home).unwrap();
-        open_real_directory(&build.home)
-            .unwrap()
-            .sync_all()
-            .unwrap();
-        build.ensure_layout().unwrap();
-        assert_owned_mode(
-            &build.target_home,
-            DirectoryOwner::of(&build.account),
-            0o700,
-        );
-    }
-
-    fn classify_test_boundary(
-        uid: u32,
-        gid: u32,
-        mode: u32,
-        prior_owner: DirectoryOwner,
-    ) -> Result<BoundaryState> {
+    fn classify_test_boundary(uid: u32, gid: u32, mode: u32) -> Result<BoundaryState> {
         BoundaryState::classify(
             DirectoryIdentity {
                 is_directory: true,
@@ -1583,7 +1244,6 @@ mod tests {
                 gid,
                 mode,
             },
-            prior_owner,
             DirectoryOwner::ROOT,
         )
     }

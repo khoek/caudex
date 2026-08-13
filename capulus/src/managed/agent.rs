@@ -5,8 +5,8 @@ use anyhow::Result;
 
 use super::{
     AgentInfo, ErrorCode, ManagedProduct, ManagementHandler, ManagementRequest, ManagementResponse,
-    PeerCredentials, ProtocolError, RedeployCoordinator, ResolvedRelease, SystemInstallation,
-    VersionTarget,
+    PeerCredentials, ProtocolError, RedeployCoordinator, ResolvedRelease, ResolvedReleaseInfo,
+    SystemInstallation, VersionTarget,
 };
 
 pub trait ReleaseSource: Send + Sync + 'static {
@@ -55,17 +55,20 @@ impl<S: ReleaseSource> ManagementHandler for ManagedAgent<S> {
                 .releases
                 .resolve(target)
                 .await
-                .map(|release| ManagementResponse::Resolved {
-                    version: release.version.to_string(),
+                .map(|release| {
+                    ManagementResponse::Resolved(ResolvedReleaseInfo {
+                        version: release.version,
+                        cargo_registry: release
+                            .registry
+                            .cargo_registry_name()
+                            .map(ToString::to_string),
+                    })
                 })
                 .map_err(unavailable),
-            ManagementRequest::Redeploy {
-                target,
-                reinstall_requesting_user,
-            } => {
+            ManagementRequest::Redeploy { target } => {
                 let authorization = self
                     .coordinator
-                    .authorize_redeploy(peer, reinstall_requesting_user)
+                    .authorize_redeploy(peer)
                     .map_err(unauthorized)?;
                 let release = self.releases.resolve(target).await.map_err(unavailable)?;
                 authorization

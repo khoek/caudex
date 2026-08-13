@@ -11,10 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rustix::process::{Pid, Signal, kill_process_group};
 use sha2::{Digest, Sha256};
 
-use super::account::{
-    SupplementaryGroups, ensure_owned_directory, ensure_root_directory, require_root,
-};
-use super::user_install::remove_orphaned_user_installations_for_job;
+use super::account::{ensure_owned_directory, ensure_root_directory, require_root};
 use super::{BuildAccount, InstallationManifest, ManagedProduct, RedeployRequest, UnixAccount};
 
 const GLOBAL_BUILD_LOCK_ROOT: &str = "/run/capulus/locks";
@@ -24,7 +21,7 @@ const TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const RUSTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-pub struct ManagedBuild {
+pub(super) struct ManagedBuild {
     account: BuildAccount,
     request: RedeployRequest,
     job_root: PathBuf,
@@ -34,12 +31,11 @@ pub struct ManagedBuild {
 }
 
 impl ManagedBuild {
-    pub fn prepare(request: RedeployRequest) -> Result<Self> {
+    pub(super) fn prepare(request: RedeployRequest) -> Result<Self> {
         require_root()?;
         let global_lock = acquire_managed_build_lock()?;
         let account = BuildAccount::ensure()?;
         account.remove_orphaned_jobs()?;
-        remove_orphaned_user_installations_for_job(&request.product, request.job)?;
         let job_root = account
             .jobs_home
             .join(format!("{}-{}", request.product, request.job));
@@ -71,7 +67,7 @@ impl ManagedBuild {
         })
     }
 
-    pub fn ensure_toolchain(&self) -> Result<()> {
+    pub(super) fn ensure_toolchain(&self) -> Result<()> {
         if !self.account.cargo().is_file() || !self.account.rustup().is_file() {
             self.bootstrap_rustup()?;
         }
@@ -92,7 +88,7 @@ impl ManagedBuild {
         Ok(())
     }
 
-    pub fn compile(&self, product: &ManagedProduct) -> Result<BuildArtifacts> {
+    pub(super) fn compile(&self, product: &ManagedProduct) -> Result<BuildArtifacts> {
         if self.request.product != product.name() || self.request.package != product.package() {
             bail!("build request does not match the managed product");
         }
@@ -109,7 +105,8 @@ impl ManagedBuild {
             "--version",
             &self.request.release.version.to_string(),
             &self.request.package,
-            "--bins",
+            "--bin",
+            product.program().cargo_binary(),
         ]);
         if let Some(registry) = self.request.release.registry.cargo_registry_name() {
             command.args(["--registry", registry]);
@@ -124,18 +121,11 @@ impl ManagedBuild {
         let artifacts = BuildArtifacts {
             binary_directory: self.install_root.join("bin"),
             manifest: self.read_installation_manifest(product)?,
+            owner: ArtifactOwner::of(&self.account.account),
         };
-        artifacts.validate(product, &self.account.account)?;
+        artifacts.validate(product)?;
         self.validate_binary_versions(product, &artifacts)?;
         Ok(artifacts)
-    }
-
-    pub fn account(&self) -> &BuildAccount {
-        &self.account
-    }
-
-    pub(super) fn reclaim_target_for_user_install(&self) -> Result<()> {
-        self.account.reclaim_target_home()
     }
 
     fn validate_binary_versions(
@@ -144,30 +134,22 @@ impl ManagedBuild {
         artifacts: &BuildArtifacts,
     ) -> Result<()> {
         let expected = self.request.release.version.to_string();
-        for binary in product.system_binaries() {
-            let output_path = self
-                .job_root
-                .join(format!("{}-version.txt", binary.cargo_name));
-            let mut output = self.account.account.create_file(&output_path, 0o600)?;
-            let mut command =
-                self.build_account_command(artifacts.binary_directory.join(&binary.cargo_name));
-            command
-                .arg("--version")
-                .stdout(Stdio::from(output.try_clone()?));
-            run_with_deadline(
-                &mut command,
-                Duration::from_secs(30),
-                "query staged binary version",
-            )?;
-            let value = read_bounded_output(&mut output, 4096, "staged binary version")?;
-            fs::remove_file(&output_path)?;
-            if value.split_whitespace().last() != Some(expected.as_str()) {
-                bail!(
-                    "staged binary {} did not report requested version {}",
-                    binary.cargo_name,
-                    expected
-                );
-            }
+        let binary = product.program().cargo_binary();
+        let output_path = self.job_root.join(format!("{binary}-version.txt"));
+        let mut output = self.account.account.create_file(&output_path, 0o600)?;
+        let mut command = self.build_account_command(artifacts.binary_directory.join(binary));
+        command
+            .arg("--version")
+            .stdout(Stdio::from(output.try_clone()?));
+        run_with_deadline(
+            &mut command,
+            Duration::from_secs(30),
+            "query staged binary version",
+        )?;
+        let value = read_bounded_output(&mut output, 4096, "staged binary version")?;
+        fs::remove_file(&output_path)?;
+        if value.split_whitespace().last() != Some(expected.as_str()) {
+            bail!("staged binary {binary} did not report requested version {expected}");
         }
         Ok(())
     }
@@ -271,14 +253,14 @@ impl ManagedBuild {
     }
 
     fn read_installation_manifest(&self, product: &ManagedProduct) -> Result<InstallationManifest> {
-        let agent_name = product
-            .agent_executable()
-            .file_name()
-            .ok_or_else(|| anyhow!("managed agent executable has no filename"))?;
-        let staged_agent = self.install_root.join("bin").join(agent_name);
+        let staged_program = self
+            .install_root
+            .join("bin")
+            .join(product.program().cargo_binary());
         let output_path = self.job_root.join("installation-manifest.json");
         let mut output = self.account.account.create_file(&output_path, 0o600)?;
-        let mut command = self.build_account_command(&staged_agent);
+        let mut command = self.build_account_command(&staged_program);
+        command.args(product.program().command_prefix());
         command.arg("installation-manifest");
         command.stdout(Stdio::from(output.try_clone()?));
         run_with_deadline(
@@ -319,16 +301,6 @@ pub(super) fn acquire_managed_build_lock() -> Result<crate::InvocationLock> {
         .context("failed to acquire global Capulus build lock")
 }
 
-pub(super) fn try_acquire_managed_build_lock() -> Result<Option<crate::InvocationLock>> {
-    ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
-    ensure_root_directory(Path::new(GLOBAL_BUILD_LOCK_ROOT), 0o700)?;
-    match crate::acquire_named_in(GLOBAL_BUILD_LOCK_ROOT, GLOBAL_BUILD_LOCK_NAME, false) {
-        Ok(lock) => Ok(Some(lock)),
-        Err(crate::LockError::AlreadyRunning { .. }) => Ok(None),
-        Err(error) => Err(error).context("failed to acquire global Capulus cleanup lock"),
-    }
-}
-
 impl Drop for ManagedBuild {
     fn drop(&mut self) {
         if self.job_root.parent() == Some(self.account.jobs_home.as_path()) {
@@ -339,115 +311,77 @@ impl Drop for ManagedBuild {
 
 #[derive(Clone, Debug)]
 pub struct BuildArtifacts {
-    pub binary_directory: PathBuf,
-    pub manifest: InstallationManifest,
+    pub(crate) binary_directory: PathBuf,
+    pub(crate) manifest: InstallationManifest,
+    owner: ArtifactOwner,
 }
 
 impl BuildArtifacts {
-    pub fn from_local_directory(
-        product: &ManagedProduct,
-        binary_directory: impl Into<PathBuf>,
-        account: &UnixAccount,
-    ) -> Result<Self> {
+    pub fn from_installed_program(product: &ManagedProduct) -> Result<Self> {
         require_root()?;
-        account.validate_interactive()?;
-        let binary_directory = binary_directory.into();
-        validate_local_artifact_directory(&binary_directory, account)?;
+        let installed = product.program().trusted_installed_path()?;
+        let running = fs::canonicalize("/proc/self/exe")
+            .context("failed to resolve the running managed program")?;
+        if running != fs::canonicalize(installed)? {
+            bail!(
+                "initial system setup must run from the installed managed program at {}",
+                installed.display()
+            );
+        }
         let artifacts = Self {
-            binary_directory,
+            binary_directory: installed
+                .parent()
+                .expect("validated managed program has a parent")
+                .to_path_buf(),
             manifest: product.installation_manifest(),
+            owner: ArtifactOwner::ROOT,
         };
-        product.validate_release_manifest(&artifacts.manifest, product.version())?;
-        artifacts.validate(product, account)?;
-        artifacts.validate_versions(product, account)?;
+        artifacts.validate(product)?;
         Ok(artifacts)
     }
 
-    pub(crate) fn validate(&self, product: &ManagedProduct, account: &UnixAccount) -> Result<()> {
+    pub(crate) fn validate(&self, product: &ManagedProduct) -> Result<()> {
         product.validate_release_manifest(&self.manifest, &self.manifest.version)?;
-        for file in &self.manifest.files {
-            let super::ManagedFile::Binary { source_name, .. } = file else {
-                continue;
-            };
-            let path = self.binary_directory.join(source_name);
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("missing staged binary {}", path.display()))?;
-            if !metadata.file_type().is_file()
-                || metadata.uid() != account.uid
-                || metadata.gid() != account.gid
-                || metadata.permissions().mode() & 0o111 == 0
-            {
-                bail!(
-                    "staged artifact is not an executable regular file owned by the source account: {}",
-                    path.display()
-                );
-            }
+        let path = self.binary_directory.join(product.program().cargo_binary());
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("missing staged program {}", path.display()))?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != self.owner.uid
+            || metadata.gid() != self.owner.gid
+            || metadata.permissions().mode() & 0o111 == 0
+        {
+            bail!(
+                "staged program is not an executable regular file owned by the declared artifact owner: {}",
+                path.display()
+            );
         }
         Ok(())
     }
 
-    fn validate_versions(&self, product: &ManagedProduct, account: &UnixAccount) -> Result<()> {
-        let expected_version = product.version().to_string();
-        for binary in product.system_binaries() {
-            let mut output =
-                tempfile::tempfile().context("failed to create version output file")?;
-            let mut command = account.command(
-                self.binary_directory.join(&binary.cargo_name),
-                SupplementaryGroups::Initialize,
-            );
-            command
-                .arg("--version")
-                .stdout(Stdio::from(output.try_clone()?))
-                .stderr(Stdio::null());
-            run_with_deadline(
-                &mut command,
-                Duration::from_secs(30),
-                "query local installation artifact version",
-            )?;
-            output.rewind()?;
-            let mut value = String::new();
-            output.take(4097).read_to_string(&mut value)?;
-            if value.len() > 4096 || value.split_whitespace().last() != Some(&expected_version) {
-                bail!(
-                    "local artifact {} did not report expected version {}",
-                    binary.cargo_name,
-                    product.version()
-                );
-            }
-        }
-        Ok(())
+    pub(crate) fn owner(&self) -> ArtifactOwner {
+        self.owner
     }
 }
 
-fn validate_local_artifact_directory(path: &Path, account: &UnixAccount) -> Result<()> {
-    if !path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::CurDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        bail!("local artifact directory must be normalized and absolute");
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArtifactOwner {
+    uid: u32,
+    gid: u32,
+}
+
+impl ArtifactOwner {
+    const ROOT: Self = Self { uid: 0, gid: 0 };
+
+    fn of(account: &UnixAccount) -> Self {
+        Self {
+            uid: account.uid,
+            gid: account.gid,
+        }
     }
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "failed to inspect local artifact directory {}",
-            path.display()
-        )
-    })?;
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != account.uid
-        || metadata.gid() != account.gid
-    {
-        bail!(
-            "local artifact directory is not a real directory owned by {}",
-            account.name
-        );
+
+    pub(crate) fn owns(&self, metadata: &fs::Metadata) -> bool {
+        metadata.uid() == self.uid && metadata.gid() == self.gid
     }
-    Ok(())
 }
 
 fn rustup_target() -> Result<&'static str> {

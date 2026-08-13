@@ -1,9 +1,10 @@
 use std::fmt::{self, Display, Formatter};
 
 use rand::RngExt;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 2;
 pub(crate) const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -51,7 +52,7 @@ impl Display for JobId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PeerCredentials {
     pub pid: u32,
     pub uid: u32,
@@ -74,7 +75,6 @@ pub enum ManagementRequest {
     },
     Redeploy {
         target: VersionTarget,
-        reinstall_requesting_user: bool,
     },
     JobStatus {
         job: JobId,
@@ -88,10 +88,16 @@ pub enum ManagementRequest {
 #[serde(rename_all = "kebab-case", tag = "result")]
 pub enum ManagementResponse {
     Info(AgentInfo),
-    Resolved { version: String },
+    Resolved(ResolvedReleaseInfo),
     Redeploy(RedeployOutcome),
     Job(RedeployJob),
     Repair(RepairOutcome),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolvedReleaseInfo {
+    pub version: Version,
+    pub cargo_registry: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,13 +122,11 @@ pub enum JobPhase {
     Queued,
     Preparing,
     Toolchain,
-    Resolving,
     Building,
     Validating,
     Staging,
     CommittingSystem,
     RestartingAgent,
-    ReinstallingUser,
     Complete,
     Failed,
 }
@@ -143,7 +147,6 @@ pub struct RedeployJob {
     pub detail: String,
     pub system_committed: bool,
     pub rollback_succeeded: Option<bool>,
-    pub required_user_reinstalled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -270,20 +273,9 @@ mod tests {
             maximum_protocol_major: PROTOCOL_MAJOR,
             request: ManagementRequest::Redeploy {
                 target: VersionTarget::Exact("1.2.3".to_string()),
-                reinstall_requesting_user: true,
             },
         };
         let encoded = encode(&envelope).unwrap();
-        assert_eq!(
-            hex(&encoded),
-            concat!(
-                "a46a726571756573745f69649018de18de18de18de18de18de18de18de18de18de18de18de18de18de18de18",
-                "de766d696e696d756d5f70726f746f636f6c5f6d616a6f7201766d6178696d756d5f70726f746f636f6c5f6d",
-                "616a6f72016772657175657374a3666d6574686f646872656465706c6f7966746172676574a2646b696e6465",
-                "65786163746776657273696f6e65312e322e3378197265696e7374616c6c5f72657175657374696e675f7573",
-                "6572f5"
-            )
-        );
         let decoded: RequestEnvelope = decode(&encoded).unwrap();
 
         assert_eq!(decoded.request_id, envelope.request_id);
@@ -291,14 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v1_ignores_additive_envelope_and_method_fields() {
+    fn protocol_v2_ignores_additive_envelope_and_method_fields() {
         let envelope = RequestEnvelope {
             request_id: RequestId([0xDE; 16]),
             minimum_protocol_major: PROTOCOL_MAJOR,
             maximum_protocol_major: PROTOCOL_MAJOR,
             request: ManagementRequest::Redeploy {
                 target: VersionTarget::Latest,
-                reinstall_requesting_user: false,
             },
         };
         let mut value: ciborium::Value =
@@ -330,17 +321,6 @@ mod tests {
         assert_eq!(decoded.request, envelope.request);
     }
 
-    fn hex(bytes: &[u8]) -> String {
-        use std::fmt::Write as _;
-
-        bytes
-            .iter()
-            .fold(String::with_capacity(bytes.len() * 2), |mut value, byte| {
-                write!(value, "{byte:02x}").unwrap();
-                value
-            })
-    }
-
     #[test]
     fn job_ids_are_fixed_lowercase_hex() {
         let id = JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
@@ -365,7 +345,6 @@ mod tests {
             maximum_protocol_major: PROTOCOL_MAJOR,
             request: ManagementRequest::Redeploy {
                 target: VersionTarget::Latest,
-                reinstall_requesting_user: false,
             },
         };
         let mut encoded = encode(&envelope).unwrap();

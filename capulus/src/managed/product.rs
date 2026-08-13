@@ -1,11 +1,16 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-const INSTALLATION_SCHEMA_MAJOR: u16 = 1;
+use super::validation::is_valid_identifier;
+
+const INSTALLATION_SCHEMA_MAJOR: u16 = 2;
 const MINIMUM_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
 const MAXIMUM_BUILD_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const REDEPLOY_FIXED_BUDGET: Duration = Duration::from_secs(35 * 60);
@@ -17,11 +22,9 @@ pub struct ManagedProductOptions {
     pub product: String,
     pub package: String,
     pub version: Version,
-    pub system_binaries: Vec<SystemBinary>,
-    pub user_binary: UserBinary,
-    pub agent_binary: PathBuf,
+    pub program: ManagedProgramOptions,
     pub service: AgentServiceOptions,
-    pub application_socket: ApplicationSocketOptions,
+    pub application_socket: SocketOptions,
     pub management_socket: SocketOptions,
     pub redeploy: ManagedRedeployOptions,
 }
@@ -30,9 +33,7 @@ impl ManagedProductOptions {
     pub fn validate(self) -> Result<ManagedProduct, ProductValidationError> {
         validate_identifier("product", &self.product)?;
         validate_identifier("package", &self.package)?;
-        if self.system_binaries.is_empty() {
-            return Err(ProductValidationError::MissingSystemBinary);
-        }
+        let program = self.program.validate()?;
         if !(MINIMUM_BUILD_TIMEOUT..=MAXIMUM_BUILD_TIMEOUT).contains(&self.redeploy.build_timeout) {
             return Err(ProductValidationError::BuildTimeout);
         }
@@ -42,71 +43,26 @@ impl ManagedProductOptions {
         let runtime_max = self
             .redeploy
             .build_timeout
-            .checked_mul(2)
-            .and_then(|duration| duration.checked_add(REDEPLOY_FIXED_BUDGET))
+            .checked_add(REDEPLOY_FIXED_BUDGET)
             .ok_or(ProductValidationError::RedeployRuntime)?;
-        let expected_binary_directory = Path::new("/usr/local/bin");
-        let mut cargo_names = BTreeSet::new();
-        let mut destinations = BTreeSet::new();
-        for binary in &self.system_binaries {
-            validate_identifier("Cargo binary", &binary.cargo_name)?;
-            validate_absolute_path(&binary.destination)?;
-            if binary.destination.parent() != Some(expected_binary_directory) {
-                return Err(ProductValidationError::BinaryDestination(
-                    binary.destination.clone(),
-                ));
-            }
-            if binary
-                .destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                != Some(binary.cargo_name.as_str())
-            {
-                return Err(ProductValidationError::BinaryNameMismatch {
-                    cargo_name: binary.cargo_name.clone(),
-                    destination: binary.destination.clone(),
-                });
-            }
-            if !cargo_names.insert(binary.cargo_name.clone()) {
-                return Err(ProductValidationError::DuplicateBinary(
-                    binary.cargo_name.clone(),
-                ));
-            }
-            if !destinations.insert(binary.destination.clone()) {
-                return Err(ProductValidationError::DuplicateDestination(
-                    binary.destination.clone(),
-                ));
-            }
-        }
-        validate_identifier("user Cargo binary", &self.user_binary.cargo_name)?;
-        if !cargo_names.contains(&self.user_binary.cargo_name) {
-            return Err(ProductValidationError::MissingUserBinary(
-                self.user_binary.cargo_name,
-            ));
-        }
-        validate_absolute_path(&self.agent_binary)?;
-        if !destinations.contains(&self.agent_binary) {
-            return Err(ProductValidationError::UnknownAgentBinary(
-                self.agent_binary.clone(),
-            ));
-        }
-        validate_service(&self.product, &self.service, &destinations)?;
-        validate_socket(
-            &self.product,
-            "application",
-            self.application_socket.options(),
-        )?;
+        validate_service(&self.product, &self.service)?;
+        validate_socket(&self.product, "application", &self.application_socket)?;
         validate_socket(&self.product, "capulus", &self.management_socket)?;
-        if self.application_socket.options().path == self.management_socket.path {
+        match (
+            self.management_socket.mode,
+            self.management_socket.group.as_deref(),
+        ) {
+            (0o600, None) | (0o660, Some(_)) => {}
+            _ => return Err(ProductValidationError::ManagementSocketAccess),
+        }
+        if self.application_socket.path == self.management_socket.path {
             return Err(ProductValidationError::DuplicateSocketPath);
         }
         Ok(ManagedProduct {
             product: self.product,
             package: self.package,
             version: self.version,
-            system_binaries: self.system_binaries,
-            user_binary: self.user_binary,
-            agent_binary: self.agent_binary,
+            program,
             service: self.service,
             application_socket: self.application_socket,
             management_socket: self.management_socket,
@@ -132,21 +88,110 @@ impl Default for ManagedRedeployOptions {
 }
 
 #[derive(Clone, Debug)]
-pub struct SystemBinary {
-    pub cargo_name: String,
-    pub destination: PathBuf,
+pub struct ManagedProgramOptions {
+    pub cargo_binary: String,
+    pub installed_path: PathBuf,
+    pub command_prefix: Vec<String>,
+}
+
+impl ManagedProgramOptions {
+    fn validate(self) -> Result<ManagedProgram, ProductValidationError> {
+        validate_identifier("Cargo binary", &self.cargo_binary)?;
+        validate_absolute_path(&self.installed_path)?;
+        if self.installed_path.parent() != Some(Path::new("/usr/local/bin")) {
+            return Err(ProductValidationError::BinaryDestination(
+                self.installed_path,
+            ));
+        }
+        if self
+            .installed_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(self.cargo_binary.as_str())
+        {
+            return Err(ProductValidationError::BinaryNameMismatch {
+                cargo_name: self.cargo_binary,
+                destination: self.installed_path,
+            });
+        }
+        if self.command_prefix.is_empty() {
+            return Err(ProductValidationError::MissingCommandPrefix);
+        }
+        for command in &self.command_prefix {
+            validate_identifier("managed command prefix", command)?;
+        }
+        Ok(ManagedProgram {
+            cargo_binary: self.cargo_binary,
+            installed_path: self.installed_path,
+            command_prefix: self.command_prefix,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct UserBinary {
-    pub cargo_name: String,
+pub struct ManagedProgram {
+    cargo_binary: String,
+    installed_path: PathBuf,
+    command_prefix: Vec<String>,
+}
+
+impl ManagedProgram {
+    pub fn cargo_binary(&self) -> &str {
+        &self.cargo_binary
+    }
+
+    pub fn installed_path(&self) -> &Path {
+        &self.installed_path
+    }
+
+    pub fn command_prefix(&self) -> &[String] {
+        &self.command_prefix
+    }
+
+    pub fn trusted_installed_path(&self) -> Result<&Path> {
+        for directory in ["/", "/usr", "/usr/local", "/usr/local/bin"] {
+            let path = Path::new(directory);
+            let metadata = fs::symlink_metadata(path).with_context(|| {
+                format!(
+                    "failed to inspect managed-program directory {}",
+                    path.display()
+                )
+            })?;
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != 0
+                || metadata.gid() != 0
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                bail!(
+                    "managed-program directory must be a root-owned, non-writable real directory: {}",
+                    path.display()
+                );
+            }
+        }
+        let metadata = fs::symlink_metadata(&self.installed_path).with_context(|| {
+            format!(
+                "managed program is not installed at {}",
+                self.installed_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.permissions().mode() & 0o7777 != 0o755
+        {
+            bail!(
+                "managed program must be a root-owned, mode-0755 regular file: {}",
+                self.installed_path.display()
+            );
+        }
+        Ok(&self.installed_path)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct AgentServiceOptions {
     pub description: String,
-    pub executable: PathBuf,
-    pub arguments: Vec<String>,
+    pub command: Vec<String>,
     pub restart_delay: Duration,
     pub network_required: bool,
     pub state_directory_mode: u32,
@@ -170,33 +215,13 @@ pub struct SocketOptions {
 }
 
 #[derive(Clone, Debug)]
-pub enum ApplicationSocketOptions {
-    AgentBound(SocketOptions),
-    SystemdActivated(SocketOptions),
-}
-
-impl ApplicationSocketOptions {
-    fn options(&self) -> &SocketOptions {
-        match self {
-            Self::AgentBound(options) | Self::SystemdActivated(options) => options,
-        }
-    }
-
-    fn is_systemd_activated(&self) -> bool {
-        matches!(self, Self::SystemdActivated(_))
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct ManagedProduct {
     product: String,
     package: String,
     version: Version,
-    system_binaries: Vec<SystemBinary>,
-    user_binary: UserBinary,
-    agent_binary: PathBuf,
+    program: ManagedProgram,
     service: AgentServiceOptions,
-    application_socket: ApplicationSocketOptions,
+    application_socket: SocketOptions,
     management_socket: SocketOptions,
     redeploy: ManagedRedeployOptions,
     redeploy_runtime_max: Duration,
@@ -215,12 +240,8 @@ impl ManagedProduct {
         &self.version
     }
 
-    pub fn system_binaries(&self) -> &[SystemBinary] {
-        &self.system_binaries
-    }
-
-    pub fn user_binary(&self) -> &UserBinary {
-        &self.user_binary
+    pub fn program(&self) -> &ManagedProgram {
+        &self.program
     }
 
     pub fn build_timeout(&self) -> Duration {
@@ -236,19 +257,15 @@ impl ManagedProduct {
     }
 
     pub fn application_socket_path(&self) -> &Path {
-        &self.application_socket.options().path
-    }
-
-    pub fn application_socket_is_systemd_activated(&self) -> bool {
-        self.application_socket.is_systemd_activated()
+        &self.application_socket.path
     }
 
     pub fn management_socket_path(&self) -> &Path {
         &self.management_socket.path
     }
 
-    pub fn agent_executable(&self) -> &Path {
-        &self.agent_binary
+    pub fn management_operator_group(&self) -> Option<&str> {
+        self.management_socket.group.as_deref()
     }
 
     pub fn service_name(&self) -> String {
@@ -267,45 +284,39 @@ impl ManagedProduct {
         let service_name = self.service_name();
         let application_socket_name = self.application_socket_name();
         let management_socket_name = self.management_socket_name();
-        let mut files = self
-            .system_binaries
-            .iter()
-            .map(|binary| ManagedFile::Binary {
-                source_name: binary.cargo_name.clone(),
-                destination: binary.destination.clone(),
+        let files = vec![
+            ManagedFile::Binary {
+                source_name: self.program.cargo_binary.clone(),
+                destination: self.program.installed_path.clone(),
                 mode: 0o755,
-            })
-            .chain([
-                ManagedFile::Text {
-                    destination: system_unit_path(&service_name),
-                    contents: self.service_unit_contents(),
-                    mode: 0o644,
-                },
-                ManagedFile::Text {
-                    destination: system_unit_path(&management_socket_name),
-                    contents: self.socket_unit_contents("capulus", &self.management_socket),
-                    mode: 0o644,
-                },
-            ])
-            .collect::<Vec<_>>();
-        let mut enable_units = vec![management_socket_name, service_name];
-        if let ApplicationSocketOptions::SystemdActivated(application_socket) =
-            &self.application_socket
-        {
-            files.push(ManagedFile::Text {
-                destination: system_unit_path(&application_socket_name),
-                contents: self.socket_unit_contents("application", application_socket),
+            },
+            ManagedFile::Text {
+                destination: system_unit_path(&service_name),
+                contents: self.service_unit_contents(),
                 mode: 0o644,
-            });
-            enable_units.insert(0, application_socket_name);
-        }
+            },
+            ManagedFile::Text {
+                destination: system_unit_path(&management_socket_name),
+                contents: self.socket_unit_contents("capulus", &self.management_socket),
+                mode: 0o644,
+            },
+            ManagedFile::Text {
+                destination: system_unit_path(&application_socket_name),
+                contents: self.socket_unit_contents("application", &self.application_socket),
+                mode: 0o644,
+            },
+        ];
         InstallationManifest {
             schema_major: INSTALLATION_SCHEMA_MAJOR,
             product: self.product.clone(),
             package: self.package.clone(),
             version: self.version.clone(),
             files,
-            enable_units,
+            enable_units: vec![
+                application_socket_name,
+                management_socket_name,
+                service_name,
+            ],
         }
     }
 
@@ -328,11 +339,11 @@ impl ManagedProduct {
             });
         }
 
-        let expected_binaries = self
-            .system_binaries
-            .iter()
-            .map(|binary| (binary.cargo_name.clone(), binary.destination.clone(), 0o755))
-            .collect::<BTreeSet<_>>();
+        let expected_binary = (
+            self.program.cargo_binary.clone(),
+            self.program.installed_path.clone(),
+            0o755,
+        );
         let actual_binaries = manifest
             .files
             .iter()
@@ -344,15 +355,15 @@ impl ManagedProduct {
                 } => Some((source_name.clone(), destination.clone(), *mode)),
                 ManagedFile::Text { .. } => None,
             })
-            .collect::<BTreeSet<_>>();
-        if actual_binaries != expected_binaries {
-            return Err(ProductValidationError::ManifestBinarySet);
+            .collect::<Vec<_>>();
+        if actual_binaries.as_slice() != [expected_binary] {
+            return Err(ProductValidationError::ManifestBinary);
         }
 
         let service = self.service_name();
         let management = self.management_socket_name();
         let application = self.application_socket_name();
-        let allowed_units = BTreeSet::from([service.clone(), management.clone(), application]);
+        let expected_units = BTreeSet::from([service, management, application]);
         let present_units = manifest
             .files
             .iter()
@@ -364,10 +375,7 @@ impl ManagedProduct {
                 ManagedFile::Binary { .. } => None,
             })
             .collect::<BTreeSet<_>>();
-        if !present_units.is_subset(&allowed_units) {
-            return Err(ProductValidationError::UnexpectedManagedUnit);
-        }
-        if !present_units.contains(&service) || !present_units.contains(&management) {
+        if present_units != expected_units {
             return Err(ProductValidationError::MissingRequiredUnit);
         }
         if manifest
@@ -385,15 +393,11 @@ impl ManagedProduct {
 
     fn service_unit_contents(&self) -> String {
         let management_socket = self.management_socket_name();
-        let socket_dependencies = if self.application_socket.is_systemd_activated() {
-            let application_socket = self.application_socket_name();
-            format!(
-                "Requires={application_socket} {management_socket}\n\
-                 After={application_socket} {management_socket}\n"
-            )
-        } else {
-            format!("Requires={management_socket}\nAfter={management_socket}\n")
-        };
+        let application_socket = self.application_socket_name();
+        let socket_dependencies = format!(
+            "Requires={application_socket} {management_socket}\n\
+             After={application_socket} {management_socket}\n"
+        );
         let network = if self.service.network_required {
             "After=network-online.target\nWants=network-online.target\n"
         } else {
@@ -446,9 +450,10 @@ impl ManagedProduct {
             .to_string(),
         };
         let arguments = self
-            .service
-            .arguments
+            .program
+            .command_prefix
             .iter()
+            .chain(&self.service.command)
             .map(|argument| format!(" {}", quote_systemd_word(argument)))
             .collect::<String>();
         format!(
@@ -474,9 +479,9 @@ impl ManagedProduct {
              {hardening}\
              \n\
              [Install]\n\
-             WantedBy=multi-user.target\n",
+            WantedBy=multi-user.target\n",
             self.service.description,
-            quote_systemd_path(&self.service.executable),
+            quote_systemd_path(&self.program.installed_path),
             arguments,
             self.service.restart_delay.as_secs(),
             self.product,
@@ -593,8 +598,8 @@ impl InstallationManifest {
                 ));
             }
         }
-        if binary_count == 0 {
-            return Err(ProductValidationError::MissingSystemBinary);
+        if binary_count != 1 {
+            return Err(ProductValidationError::ManifestBinaryCount(binary_count));
         }
         for unit in &self.enable_units {
             if !unit.starts_with(&unit_prefix)
@@ -637,8 +642,8 @@ pub enum ManagedFile {
 pub enum ProductValidationError {
     #[error("{field} must be a lowercase ASCII identifier: {value:?}")]
     Identifier { field: &'static str, value: String },
-    #[error("managed product must install at least one system binary")]
-    MissingSystemBinary,
+    #[error("managed program command prefix must contain at least one subcommand")]
+    MissingCommandPrefix,
     #[error("managed build timeout must be at least 60 seconds")]
     BuildTimeout,
     #[error("managed redeploy task limit must be between 16 and 32768")]
@@ -652,16 +657,8 @@ pub enum ProductValidationError {
         cargo_name: String,
         destination: PathBuf,
     },
-    #[error("managed product contains duplicate Cargo binary {0:?}")]
-    DuplicateBinary(String),
     #[error("managed product contains duplicate destination {0}")]
     DuplicateDestination(PathBuf),
-    #[error("user Cargo binary {0:?} is not among the managed system binaries")]
-    MissingUserBinary(String),
-    #[error("agent executable {0} is not among the managed system binary destinations")]
-    UnknownAgentExecutable(PathBuf),
-    #[error("agent binary {0} is not among the managed system binary destinations")]
-    UnknownAgentBinary(PathBuf),
     #[error("agent service description or argument contains forbidden control/specifier bytes")]
     UnsafeServiceText,
     #[error("agent restart delay must be between one second and one hour")]
@@ -676,6 +673,8 @@ pub enum ProductValidationError {
     SocketPath { expected: PathBuf, actual: PathBuf },
     #[error("socket mode must grant no permissions outside 0777")]
     SocketMode,
+    #[error("management socket must be root-only 0600 or operator-group 0660")]
+    ManagementSocketAccess,
     #[error("application and Capulus sockets must have distinct paths")]
     DuplicateSocketPath,
     #[error("installation manifest schema v{0} is unsupported")]
@@ -686,11 +685,11 @@ pub enum ProductValidationError {
     ManifestPackage { actual: String, expected: String },
     #[error("installation manifest version is {actual}, expected {expected}")]
     ManifestVersion { actual: Version, expected: Version },
-    #[error("installation manifest has a different managed binary set")]
-    ManifestBinarySet,
-    #[error("installation manifest contains an unexpected managed unit")]
-    UnexpectedManagedUnit,
-    #[error("installation manifest omits its service or Capulus socket")]
+    #[error("installation manifest does not contain the declared managed program")]
+    ManifestBinary,
+    #[error("installation manifest must contain exactly one managed program, found {0}")]
+    ManifestBinaryCount(usize),
+    #[error("installation manifest must contain exactly the service and both sockets")]
     MissingRequiredUnit,
     #[error("installation manifest unit files and enabled units differ")]
     UnitEnablement,
@@ -716,29 +715,15 @@ fn validate_identifier(field: &'static str, value: &str) -> Result<(), ProductVa
     Ok(())
 }
 
-pub(super) fn is_valid_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value.as_bytes()[0].is_ascii_lowercase()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
-}
-
 fn validate_service(
     product: &str,
     service: &AgentServiceOptions,
-    binary_destinations: &BTreeSet<PathBuf>,
 ) -> Result<(), ProductValidationError> {
-    if !binary_destinations.contains(&service.executable) {
-        return Err(ProductValidationError::UnknownAgentExecutable(
-            service.executable.clone(),
-        ));
-    }
     if service.description.is_empty()
         || unsafe_unit_text(&service.description)
+        || service.command.is_empty()
         || service
-            .arguments
+            .command
             .iter()
             .any(|argument| unsafe_unit_text(argument))
     {
@@ -875,24 +860,14 @@ mod tests {
             product: "auc".to_string(),
             package: "auc-tool".to_string(),
             version: Version::new(0, 1, 0),
-            system_binaries: vec![
-                SystemBinary {
-                    cargo_name: "auc".to_string(),
-                    destination: PathBuf::from("/usr/local/bin/auc"),
-                },
-                SystemBinary {
-                    cargo_name: "auc-agent".to_string(),
-                    destination: PathBuf::from("/usr/local/bin/auc-agent"),
-                },
-            ],
-            user_binary: UserBinary {
-                cargo_name: "auc".to_string(),
+            program: ManagedProgramOptions {
+                cargo_binary: "auc".to_string(),
+                installed_path: PathBuf::from("/usr/local/bin/auc"),
+                command_prefix: vec!["agent".to_string()],
             },
-            agent_binary: PathBuf::from("/usr/local/bin/auc-agent"),
             service: AgentServiceOptions {
                 description: "auc virtual authenticator".to_string(),
-                executable: PathBuf::from("/usr/local/bin/auc-agent"),
-                arguments: vec!["serve".to_string()],
+                command: vec!["serve".to_string()],
                 restart_delay: Duration::from_secs(5),
                 network_required: false,
                 state_directory_mode: 0o700,
@@ -901,11 +876,11 @@ mod tests {
                     device_allow: vec![PathBuf::from("/dev/uhid")],
                 },
             },
-            application_socket: ApplicationSocketOptions::SystemdActivated(SocketOptions {
+            application_socket: SocketOptions {
                 path: PathBuf::from("/run/auc/agent.sock"),
                 mode: 0o660,
                 group: Some("auc".to_string()),
-            }),
+            },
             management_socket: SocketOptions {
                 path: PathBuf::from("/run/auc/capulus.sock"),
                 mode: 0o660,
@@ -950,36 +925,27 @@ mod tests {
     }
 
     #[test]
-    fn release_manifest_can_move_an_application_socket_to_systemd() {
-        let target = options().validate().unwrap();
-        let mut bridge_options = options();
-        bridge_options.application_socket = ApplicationSocketOptions::AgentBound(SocketOptions {
-            path: PathBuf::from("/run/auc/agent.sock"),
-            mode: 0o660,
-            group: Some("auc".to_string()),
+    fn release_manifest_requires_the_application_socket() {
+        let product = options().validate().unwrap();
+        let mut manifest = product.installation_manifest();
+        manifest.files.retain(|file| {
+            let destination = match file {
+                ManagedFile::Text { destination, .. } | ManagedFile::Binary { destination, .. } => {
+                    destination
+                }
+            };
+            destination != Path::new("/etc/systemd/system/auc-agent.socket")
         });
-        let bridge = bridge_options.validate().unwrap();
-        let bridge_manifest = bridge.installation_manifest();
-        let target_manifest = target.installation_manifest();
+        manifest
+            .enable_units
+            .retain(|unit| unit != "auc-agent.socket");
 
-        assert!(
-            !bridge_manifest
-                .enable_units
-                .contains(&bridge.application_socket_name())
-        );
-        assert!(
-            bridge_manifest
-                .files
-                .iter()
-                .filter_map(|file| match file {
-                    ManagedFile::Text { contents, .. } => Some(contents),
-                    ManagedFile::Binary { .. } => None,
-                })
-                .any(|contents| contents.contains("Requires=auc-capulus.socket\n"))
-        );
-        bridge
-            .validate_release_manifest(&target_manifest, target.version())
-            .unwrap();
+        assert!(matches!(
+            product
+                .validate_release_manifest(&manifest, product.version())
+                .unwrap_err(),
+            ProductValidationError::MissingRequiredUnit
+        ));
     }
 
     #[test]
@@ -1013,18 +979,18 @@ mod tests {
         let product = options().validate().unwrap();
         assert_eq!(
             product.redeploy_runtime_max(),
-            product.build_timeout() * 2 + REDEPLOY_FIXED_BUDGET
+            product.build_timeout() + REDEPLOY_FIXED_BUDGET
         );
     }
 
     #[test]
     fn options_reject_parent_traversal_and_mismatched_binary_names() {
         let mut unsafe_options = options();
-        unsafe_options.system_binaries[0].destination = PathBuf::from("/usr/local/bin/../bin/auc");
+        unsafe_options.program.installed_path = PathBuf::from("/usr/local/bin/../bin/auc");
         assert!(unsafe_options.validate().is_err());
 
         let mut mismatch = options();
-        mismatch.system_binaries[0].destination = PathBuf::from("/usr/local/bin/not-auc");
+        mismatch.program.installed_path = PathBuf::from("/usr/local/bin/not-auc");
         assert!(mismatch.validate().is_err());
 
         let mut unsafe_state_mode = options();

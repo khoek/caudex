@@ -8,7 +8,7 @@ use zbus::zvariant::Value;
 use super::{JobId, ManagedProduct};
 
 #[derive(Clone, Debug)]
-pub struct SystemdManager;
+pub(super) struct SystemdManager;
 
 impl SystemdManager {
     pub fn redeploy_unit_name(product: &ManagedProduct, job: JobId) -> String {
@@ -27,16 +27,19 @@ impl SystemdManager {
         let unit = Self::redeploy_unit_name(product, job);
         let description = format!("{} managed redeploy {job}", product.name());
         let executable = product
-            .agent_executable()
+            .program()
+            .installed_path()
             .to_str()
-            .expect("validated agent executable is UTF-8")
+            .expect("validated managed program path is UTF-8")
             .to_string();
-        let arguments = vec![
-            executable.clone(),
-            "redeploy-worker".to_string(),
-            "--job".to_string(),
-            job.to_string(),
-        ];
+        let arguments = std::iter::once(executable.clone())
+            .chain(product.program().command_prefix().iter().cloned())
+            .chain([
+                "redeploy-worker".to_string(),
+                "--job".to_string(),
+                job.to_string(),
+            ])
+            .collect::<Vec<_>>();
         let exec_start = vec![(executable, arguments, false)];
         let runtime_max = duration_microseconds(product.redeploy_runtime_max())?;
         let network_online = vec!["network-online.target"];
@@ -68,10 +71,6 @@ impl SystemdManager {
             ("After", Value::from(network_online)),
             ("CollectMode", Value::from("inactive-or-failed")),
         ];
-        let properties = properties
-            .into_iter()
-            .chain(redeploy_runtime_properties(product, job))
-            .collect::<Vec<_>>();
         manager
             .start_transient_unit(&unit, Mode::Fail, &properties, &[])
             .await
@@ -154,16 +153,12 @@ impl SystemdManager {
         target_enable_units: &[String],
         previously_enabled: &[String],
         previous_service_file: bool,
-        previous_application_socket_file: bool,
     ) -> Result<(), SystemdError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
             .map_err(connect_error)?;
-        let target_application_socket =
-            target_enable_units.contains(&product.application_socket_name());
-        let cold_cutover =
-            !previous_service_file || target_application_socket != previous_application_socket_file;
+        let cold_cutover = !previous_service_file;
         if cold_cutover {
             stop_product_runtime(&connection, &manager, product).await?;
             remove_application_socket(product)?;
@@ -237,16 +232,12 @@ impl SystemdManager {
         target_enable_units: &[String],
         previously_enabled: &[String],
         previous_service_file: bool,
-        previous_application_socket_file: bool,
     ) -> Result<(), SystemdError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
             .map_err(connect_error)?;
-        let target_application_socket =
-            target_enable_units.contains(&product.application_socket_name());
-        let cold_cutover =
-            !previous_service_file || target_application_socket != previous_application_socket_file;
+        let cold_cutover = !previous_service_file;
         if cold_cutover {
             stop_product_runtime(&connection, &manager, product).await?;
             remove_application_socket(product)?;
@@ -274,28 +265,15 @@ impl SystemdManager {
                     .await
                     .map_err(|source| operation(format!("restore {socket}"), source))?;
             }
-            if cold_cutover {
-                manager
-                    .start_unit(&product.service_name(), Mode::Replace)
-                    .await
-                    .map_err(|source| {
-                        operation(format!("start restored {}", product.service_name()), source)
-                    })?;
-            } else {
-                manager
-                    .restart_unit(&product.service_name(), Mode::Replace)
-                    .await
-                    .map_err(|source| {
-                        operation(
-                            format!("restart restored {}", product.service_name()),
-                            source,
-                        )
-                    })?;
-            }
-        } else {
-            for unit in managed_unit_names(product) {
-                stop_unit_if_present(&connection, &manager, &unit).await?;
-            }
+            manager
+                .restart_unit(&product.service_name(), Mode::Replace)
+                .await
+                .map_err(|source| {
+                    operation(
+                        format!("restart restored {}", product.service_name()),
+                        source,
+                    )
+                })?;
         }
         Ok(())
     }
@@ -331,23 +309,6 @@ impl SystemdManager {
             .await
             .map_err(|source| operation("reload systemd after managed file removal", source))
     }
-}
-
-fn redeploy_runtime_directory(product: &ManagedProduct, job: JobId) -> String {
-    format!("capulus/user-installs/{}-{job}", product.name())
-}
-
-fn redeploy_runtime_properties(
-    product: &ManagedProduct,
-    job: JobId,
-) -> [(&'static str, Value<'static>); 2] {
-    [
-        (
-            "RuntimeDirectory",
-            Value::from(vec![redeploy_runtime_directory(product, job)]),
-        ),
-        ("RuntimeDirectoryMode", Value::from(0o711_u32)),
-    ]
 }
 
 fn managed_unit_names(product: &ManagedProduct) -> [String; 3] {
@@ -553,8 +514,8 @@ mod tests {
 
     use super::*;
     use crate::managed::{
-        AgentServiceOptions, ApplicationSocketOptions, ManagedProductOptions,
-        ManagedRedeployOptions, ServiceHardening, SocketOptions, SystemBinary, UserBinary,
+        AgentServiceOptions, ManagedProductOptions, ManagedProgramOptions, ManagedRedeployOptions,
+        ServiceHardening, SocketOptions,
     };
 
     fn product() -> ManagedProduct {
@@ -562,24 +523,14 @@ mod tests {
             product: "auc".to_string(),
             package: "auc-tool".to_string(),
             version: Version::new(0, 1, 0),
-            system_binaries: vec![
-                SystemBinary {
-                    cargo_name: "auc".to_string(),
-                    destination: PathBuf::from("/usr/local/bin/auc"),
-                },
-                SystemBinary {
-                    cargo_name: "auc-agent".to_string(),
-                    destination: PathBuf::from("/usr/local/bin/auc-agent"),
-                },
-            ],
-            user_binary: UserBinary {
-                cargo_name: "auc".to_string(),
+            program: ManagedProgramOptions {
+                cargo_binary: "auc".to_string(),
+                installed_path: PathBuf::from("/usr/local/bin/auc"),
+                command_prefix: vec!["agent".to_string()],
             },
-            agent_binary: PathBuf::from("/usr/local/bin/auc-agent"),
             service: AgentServiceOptions {
                 description: "auc agent".to_string(),
-                executable: PathBuf::from("/usr/local/bin/auc-agent"),
-                arguments: vec!["serve".to_string()],
+                command: vec!["serve".to_string()],
                 restart_delay: Duration::from_secs(5),
                 network_required: false,
                 state_directory_mode: 0o700,
@@ -588,11 +539,11 @@ mod tests {
                     device_allow: vec![PathBuf::from("/dev/uhid")],
                 },
             },
-            application_socket: ApplicationSocketOptions::SystemdActivated(SocketOptions {
+            application_socket: SocketOptions {
                 path: PathBuf::from("/run/auc/agent.sock"),
                 mode: 0o660,
                 group: Some("auc".to_string()),
-            }),
+            },
             management_socket: SocketOptions {
                 path: PathBuf::from("/run/auc/capulus.sock"),
                 mode: 0o660,
@@ -613,21 +564,6 @@ mod tests {
         assert_eq!(
             SystemdManager::redeploy_unit_name(&product(), job),
             "auc-redeploy-deadbeefdeadbeefdeadbeefdeadbeef.service"
-        );
-        assert_eq!(
-            redeploy_runtime_directory(&product(), job),
-            "capulus/user-installs/auc-deadbeefdeadbeefdeadbeefdeadbeef"
-        );
-        let properties = redeploy_runtime_properties(&product(), job);
-        assert_eq!(properties[0].0, "RuntimeDirectory");
-        assert_eq!(
-            Vec::<String>::try_from(properties[0].1.try_clone().unwrap()).unwrap(),
-            ["capulus/user-installs/auc-deadbeefdeadbeefdeadbeefdeadbeef"]
-        );
-        assert_eq!(properties[1].0, "RuntimeDirectoryMode");
-        assert_eq!(
-            u32::try_from(properties[1].1.try_clone().unwrap()).unwrap(),
-            0o711
         );
     }
 

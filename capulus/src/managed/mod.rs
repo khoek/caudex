@@ -14,6 +14,8 @@ mod installation;
 #[cfg(feature = "managed-system")]
 mod job;
 #[cfg(feature = "managed-system")]
+mod lifecycle;
+#[cfg(feature = "managed-system")]
 mod product;
 mod protocol;
 #[cfg(feature = "managed-system")]
@@ -22,42 +24,49 @@ mod release;
 mod server;
 #[cfg(feature = "managed-system")]
 mod systemd;
-#[cfg(feature = "managed-system")]
-mod user_install;
+#[cfg(feature = "managed-client")]
+mod user_program;
+mod validation;
 #[cfg(feature = "managed-system")]
 mod worker;
 
 #[cfg(feature = "managed-system")]
-pub use account::{BuildAccount, UnixAccount, UserInstallContext};
+use account::BuildAccount;
+#[cfg(feature = "managed-system")]
+pub use account::UnixAccount;
 #[cfg(feature = "managed-system")]
 pub use activation::{ActivatedListeners, ActivationError};
 #[cfg(feature = "managed-system")]
 pub use agent::{ManagedAgent, ReleaseSource};
 #[cfg(feature = "managed-system")]
-pub use build::{BuildArtifacts, ManagedBuild};
+pub use build::BuildArtifacts;
+#[cfg(feature = "managed-system")]
+use build::ManagedBuild;
 pub use client::{ManagementClient, ManagementClientOptions};
 #[cfg(feature = "managed-system")]
 pub use installation::{SystemInstallation, SystemUninstallation};
 #[cfg(feature = "managed-system")]
 pub use job::{RedeployCoordinator, RedeployRequest};
 #[cfg(feature = "managed-system")]
+pub use lifecycle::AgentLifecycleCommand;
+#[cfg(feature = "managed-system")]
 pub use product::{
-    AgentServiceOptions, ApplicationSocketOptions, InstallationManifest, ManagedFile,
-    ManagedProduct, ManagedProductOptions, ManagedRedeployOptions, ProductValidationError,
-    ServiceHardening, SocketOptions, SystemBinary, UserBinary,
+    AgentServiceOptions, InstallationManifest, ManagedFile, ManagedProduct, ManagedProductOptions,
+    ManagedProgram, ManagedProgramOptions, ManagedRedeployOptions, ProductValidationError,
+    ServiceHardening, SocketOptions,
 };
 pub use protocol::{
     AgentInfo, ErrorCode, JobId, JobPhase, ManagementError, ManagementRequest, ManagementResponse,
     PROTOCOL_MAJOR, PeerCredentials, ProtocolError, RedeployJob, RedeployOutcome, RepairOutcome,
-    RequestId, VersionTarget,
+    RequestId, ResolvedReleaseInfo, VersionTarget,
 };
 #[cfg(feature = "managed-system")]
 pub use release::{CargoRegistry, ResolvedRelease};
 #[cfg(feature = "managed-system")]
 pub use server::{ManagementHandler, ManagementServer, ManagementServerOptions};
 #[cfg(feature = "managed-system")]
-pub use systemd::SystemdManager;
-#[cfg(feature = "managed-system")]
-pub use user_install::reinstall_user_cli;
-#[cfg(feature = "managed-system")]
-pub use worker::RedeployWorker;
+use systemd::SystemdManager;
+#[cfg(feature = "managed-client")]
+pub use user_program::{
+    UserProgramUpdate, UserProgramUpdateOptions, current_user_cargo_install_root,
+};

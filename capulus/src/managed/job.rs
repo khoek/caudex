@@ -9,10 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::account::ensure_root_directory;
 use super::systemd::SystemdError;
-use super::user_install::{CleanupDisposition, cleanup_inactive_user_installations};
 use super::{
     JobId, JobPhase, ManagedProduct, PeerCredentials, RedeployJob, RedeployOutcome,
-    ResolvedRelease, SystemdManager, UserInstallContext,
+    ResolvedRelease, SystemdManager, UnixAccount,
 };
 
 const STATE_ROOT: &str = "/var/lib/capulus/jobs";
@@ -28,7 +27,6 @@ pub struct RedeployRequest {
     pub product: String,
     pub package: String,
     pub release: ResolvedRelease,
-    pub required_user: Option<UserInstallContext>,
 }
 
 impl std::fmt::Debug for RedeployRequest {
@@ -39,10 +37,6 @@ impl std::fmt::Debug for RedeployRequest {
             .field("product", &self.product)
             .field("package", &self.package)
             .field("version", &self.release.version)
-            .field(
-                "required_user",
-                &self.required_user.as_ref().map(|user| user.uid),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -53,9 +47,6 @@ impl RedeployRequest {
             bail!("redeploy request does not match the installed managed product");
         }
         self.release.validate()?;
-        if let Some(user) = &self.required_user {
-            user.revalidate(&product.user_binary().cargo_name)?;
-        }
         Ok(())
     }
 }
@@ -78,10 +69,10 @@ impl RedeployCoordinator {
             .transpose()?;
         let startup_reconciliation = match startup_disposition(active.as_ref().zip(status.as_ref()))
         {
-            StartupDisposition::Cleanup => cleanup_inactive_user_installations()?.into(),
-            StartupDisposition::ClearAndCleanup(job) => {
+            StartupDisposition::None => StartupReconciliation::None,
+            StartupDisposition::Clear(job) => {
                 store.clear_active(job)?;
-                cleanup_inactive_user_installations()?.into()
+                StartupReconciliation::None
             }
             StartupDisposition::Monitor(job) => StartupReconciliation::Monitor(job),
         };
@@ -117,7 +108,6 @@ impl RedeployCoordinator {
             .block_on(async {
                 match self.startup_reconciliation {
                     StartupReconciliation::None => Ok(()),
-                    StartupReconciliation::Cleanup => cleanup_until_available().await,
                     StartupReconciliation::Monitor(job) => self.monitor_active_job_async(job).await,
                 }
             })
@@ -126,35 +116,30 @@ impl RedeployCoordinator {
     pub(super) fn authorize_redeploy(
         &self,
         peer: PeerCredentials,
-        reinstall_requesting_user: bool,
     ) -> Result<RedeployAuthorization> {
-        if peer.uid == 0 {
-            return Ok(RedeployAuthorization {
-                root: true,
-                required_user: None,
-            });
-        }
-        if !reinstall_requesting_user {
-            bail!("non-root redeploys must reinstall the requesting user's Cargo CLI");
-        }
-        let required_user =
-            UserInstallContext::capture(peer, &self.product.user_binary().cargo_name)?.ok_or_else(
-                || anyhow!("requesting user has no existing Cargo-installed managed CLI"),
-            )?;
+        self.authorize_operator(peer)?;
         Ok(RedeployAuthorization {
-            root: false,
-            required_user: Some(required_user),
+            root: peer.uid == 0,
         })
     }
 
     pub(super) fn authorize_repair(&self, peer: PeerCredentials) -> Result<()> {
+        self.authorize_operator(peer)
+    }
+
+    fn authorize_operator(&self, peer: PeerCredentials) -> Result<()> {
         if peer.uid == 0 {
             return Ok(());
         }
-        UserInstallContext::capture(peer, &self.product.user_binary().cargo_name)?.ok_or_else(
-            || anyhow!("requesting user has no existing Cargo-installed managed CLI"),
-        )?;
-        Ok(())
+        let group = self.product.management_operator_group().ok_or_else(|| {
+            anyhow!("the managed product permits privileged operations only from root")
+        })?;
+        let account = UnixAccount::by_uid(peer.uid)?;
+        if account.is_member_of(group)? {
+            Ok(())
+        } else {
+            bail!("requesting user is not a member of the {group} operator group")
+        }
     }
 
     pub(super) async fn schedule(
@@ -167,14 +152,11 @@ impl RedeployCoordinator {
             bail!("non-root callers cannot downgrade a managed system installation");
         }
         let _lock = capulus_lock(self.product.name())?;
-        self.reconcile_and_arm_cleanup().await?;
+        self.reconcile_active().await?;
         if let Some(active) = self.store.active()? {
             let status = self.store.status(active.job)?;
             if !status.phase.is_terminal() {
-                if active.version == release.version
-                    && active.required_uid
-                        == authorization.required_user.as_ref().map(|user| user.uid)
-                {
+                if active.version == release.version {
                     return Ok(RedeployOutcome {
                         job: active.job,
                         unit: status.unit,
@@ -197,7 +179,6 @@ impl RedeployCoordinator {
             product: self.product.name().to_string(),
             package: self.product.package().to_string(),
             release,
-            required_user: authorization.required_user,
         };
         request.validate(&self.product)?;
         self.store.write_request(&request)?;
@@ -207,7 +188,6 @@ impl RedeployCoordinator {
                 job,
                 format!("failed to start transient unit: {error}"),
                 false,
-                None,
                 None,
             )?;
             self.store.remove_request(job)?;
@@ -231,23 +211,15 @@ impl RedeployCoordinator {
         });
     }
 
-    fn spawn_cleanup_reconciler(&self) {
-        tokio::spawn(async {
-            if let Err(error) = cleanup_until_available().await {
-                eprintln!("capulus user-install cleanup reconciliation failed: {error:#}");
-            }
-        });
-    }
-
     async fn monitor_active_job_async(&self, job: JobId) -> Result<()> {
         loop {
             match monitored_job_state(self.store.active()?.as_ref(), job) {
                 MonitoredJobState::Active => {}
-                MonitoredJobState::Inactive => return cleanup_until_available().await,
+                MonitoredJobState::Inactive => return Ok(()),
                 MonitoredJobState::Superseded => return Ok(()),
             }
             match self.reconcile_active().await {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(error) if error.downcast_ref::<SystemdError>().is_some() => {
                     eprintln!("capulus systemd reconciliation failed; retrying: {error:#}");
                 }
@@ -257,7 +229,7 @@ impl RedeployCoordinator {
                 MonitoredJobState::Active => {
                     tokio::time::sleep(ACTIVE_RECONCILIATION_INTERVAL).await;
                 }
-                MonitoredJobState::Inactive => return cleanup_until_available().await,
+                MonitoredJobState::Inactive => return Ok(()),
                 MonitoredJobState::Superseded => return Ok(()),
             }
         }
@@ -269,7 +241,7 @@ impl RedeployCoordinator {
 
     pub(super) async fn reconciled_status(&self, job: JobId) -> Result<RedeployJob> {
         if self.store.active()?.is_some_and(|active| active.job == job) {
-            self.reconcile_and_arm_cleanup().await?;
+            self.reconcile_active().await?;
         }
         self.store.status(job)
     }
@@ -282,7 +254,7 @@ impl RedeployCoordinator {
     }
 
     pub async fn reconciled_active(&self) -> Result<Option<RedeployJob>> {
-        self.reconcile_and_arm_cleanup().await?;
+        self.reconcile_active().await?;
         self.active()
     }
 
@@ -310,13 +282,8 @@ impl RedeployCoordinator {
         system_committed: bool,
         rollback_succeeded: Option<bool>,
     ) -> Result<()> {
-        self.store.fail(
-            job,
-            detail.into(),
-            system_committed,
-            rollback_succeeded,
-            None,
-        )
+        self.store
+            .fail(job, detail.into(), system_committed, rollback_succeeded)
     }
 
     pub(super) fn fail_worker(
@@ -325,45 +292,23 @@ impl RedeployCoordinator {
         detail: impl Into<String>,
         system_committed: bool,
         rollback_succeeded: Option<bool>,
-        required_user_reinstalled: Option<bool>,
-    ) -> Result<()> {
-        self.store.fail(
-            job,
-            detail.into(),
-            system_committed,
-            rollback_succeeded,
-            required_user_reinstalled,
-        )
-    }
-
-    pub(super) fn record_required_user_reinstalled(
-        &self,
-        job: JobId,
-        required_user_reinstalled: bool,
     ) -> Result<()> {
         self.store
-            .record_required_user_reinstalled(job, required_user_reinstalled)
+            .fail(job, detail.into(), system_committed, rollback_succeeded)
     }
 
-    pub fn complete(&self, job: JobId, required_user_reinstalled: Option<bool>) -> Result<()> {
-        self.store.complete(job, required_user_reinstalled)
+    pub fn complete(&self, job: JobId) -> Result<()> {
+        self.store.complete(job)
     }
 
-    async fn reconcile_and_arm_cleanup(&self) -> Result<()> {
-        if self.reconcile_active().await? == CleanupDisposition::Busy {
-            self.spawn_cleanup_reconciler();
-        }
-        Ok(())
-    }
-
-    async fn reconcile_active(&self) -> Result<CleanupDisposition> {
+    async fn reconcile_active(&self) -> Result<()> {
         let Some(active) = self.store.active()? else {
-            return cleanup_inactive_user_installations();
+            return Ok(());
         };
         let status = self.store.status(active.job)?;
         if status.phase.is_terminal() {
             self.store.clear_active(active.job)?;
-            return cleanup_inactive_user_installations();
+            return Ok(());
         }
         if self
             .systemd
@@ -372,14 +317,14 @@ impl RedeployCoordinator {
             || (status.phase == JobPhase::Queued
                 && self.store.request_is_within_start_grace(active.job)?)
         {
-            return Ok(CleanupDisposition::Complete);
+            return Ok(());
         }
         let Some(current) = self.store.active()? else {
-            return cleanup_inactive_user_installations();
+            return Ok(());
         };
         let status = self.store.status(current.job)?;
         if current.job != active.job || status.phase.is_terminal() {
-            return Ok(CleanupDisposition::Complete);
+            return Ok(());
         }
         self.store.fail(
             active.job,
@@ -389,54 +334,23 @@ impl RedeployCoordinator {
             ),
             status.system_committed,
             None,
-            None,
         )?;
         self.store.remove_request(active.job)?;
-        cleanup_inactive_user_installations()
-    }
-}
-
-async fn cleanup_until_available() -> Result<()> {
-    cleanup_until_available_with(
-        cleanup_inactive_user_installations,
-        ACTIVE_RECONCILIATION_INTERVAL,
-    )
-    .await
-}
-
-async fn cleanup_until_available_with(
-    mut cleanup: impl FnMut() -> Result<CleanupDisposition>,
-    retry_interval: Duration,
-) -> Result<()> {
-    loop {
-        match cleanup()? {
-            CleanupDisposition::Complete => return Ok(()),
-            CleanupDisposition::Busy => tokio::time::sleep(retry_interval).await,
-        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StartupDisposition {
-    Cleanup,
-    ClearAndCleanup(JobId),
+    None,
+    Clear(JobId),
     Monitor(JobId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StartupReconciliation {
     None,
-    Cleanup,
     Monitor(JobId),
-}
-
-impl From<CleanupDisposition> for StartupReconciliation {
-    fn from(disposition: CleanupDisposition) -> Self {
-        match disposition {
-            CleanupDisposition::Complete => Self::None,
-            CleanupDisposition::Busy => Self::Cleanup,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,9 +362,9 @@ enum MonitoredJobState {
 
 fn startup_disposition(active: Option<(&ActiveJob, &RedeployJob)>) -> StartupDisposition {
     match active {
-        None => StartupDisposition::Cleanup,
+        None => StartupDisposition::None,
         Some((active, status)) if status.phase.is_terminal() => {
-            StartupDisposition::ClearAndCleanup(active.job)
+            StartupDisposition::Clear(active.job)
         }
         Some((active, _)) => StartupDisposition::Monitor(active.job),
     }
@@ -467,7 +381,6 @@ fn monitored_job_state(active: Option<&ActiveJob>, job: JobId) -> MonitoredJobSt
 #[derive(Debug)]
 pub(super) struct RedeployAuthorization {
     root: bool,
-    required_user: Option<UserInstallContext>,
 }
 
 impl RedeployAuthorization {
@@ -523,7 +436,6 @@ impl JobStore {
                 detail: "queued for transient systemd execution".to_string(),
                 system_committed: false,
                 rollback_succeeded: None,
-                required_user_reinstalled: None,
             },
         };
         write_json(&self.status_path(request.job), &status, 0o600)?;
@@ -532,7 +444,6 @@ impl JobStore {
             &ActiveJob {
                 job: request.job,
                 version: request.release.version.clone(),
-                required_uid: request.required_user.as_ref().map(|user| user.uid),
             },
             0o600,
         )
@@ -607,16 +518,11 @@ impl JobStore {
         detail: String,
         system_committed: bool,
         rollback_succeeded: Option<bool>,
-        required_user_reinstalled: Option<bool>,
     ) -> Result<()> {
         let mut stored: StoredJob = read_json(&self.status_path(job))?;
         if stored.status.phase.is_terminal() {
             bail!("cannot fail terminal redeploy job {job}");
         }
-        stored.status.required_user_reinstalled = failed_required_user_reinstalled(
-            stored.status.required_user_reinstalled,
-            required_user_reinstalled,
-        );
         stored.status.phase = JobPhase::Failed;
         crate::store::atomic_write(
             &self.diagnostic_path(job),
@@ -633,26 +539,12 @@ impl JobStore {
         self.clear_active(job)
     }
 
-    fn record_required_user_reinstalled(
-        &self,
-        job: JobId,
-        required_user_reinstalled: bool,
-    ) -> Result<()> {
-        let mut stored: StoredJob = read_json(&self.status_path(job))?;
-        if stored.status.phase != JobPhase::ReinstallingUser || !stored.status.system_committed {
-            bail!("cannot record a user reinstall outside the committed user-reinstall phase");
-        }
-        stored.status.required_user_reinstalled = Some(required_user_reinstalled);
-        write_json(&self.status_path(job), &stored, 0o600)
-    }
-
-    fn complete(&self, job: JobId, required_user_reinstalled: Option<bool>) -> Result<()> {
+    fn complete(&self, job: JobId) -> Result<()> {
         let mut stored: StoredJob = read_json(&self.status_path(job))?;
         validate_transition(&stored.status.phase, &JobPhase::Complete)?;
         stored.status.phase = JobPhase::Complete;
         stored.status.detail = "managed redeploy completed".to_string();
         stored.status.system_committed = true;
-        stored.status.required_user_reinstalled = required_user_reinstalled;
         write_json(&self.status_path(job), &stored, 0o600)?;
         self.clear_active(job)
     }
@@ -667,7 +559,6 @@ impl JobStore {
                 active.job,
                 "redeploy was interrupted by a system reboot".to_string(),
                 stored.status.system_committed,
-                None,
                 None,
             )?;
         }
@@ -717,7 +608,6 @@ struct StoredJob {
 struct ActiveJob {
     job: JobId,
     version: semver::Version,
-    required_uid: Option<u32>,
 }
 
 fn validate_transition(current: &JobPhase, next: &JobPhase) -> Result<()> {
@@ -735,23 +625,14 @@ fn phase_rank(phase: &JobPhase) -> u8 {
         JobPhase::Queued => 0,
         JobPhase::Preparing => 1,
         JobPhase::Toolchain => 2,
-        JobPhase::Resolving => 3,
-        JobPhase::Building => 4,
-        JobPhase::Validating => 5,
-        JobPhase::Staging => 6,
-        JobPhase::CommittingSystem => 7,
-        JobPhase::RestartingAgent => 8,
-        JobPhase::ReinstallingUser => 9,
-        JobPhase::Complete => 10,
+        JobPhase::Building => 3,
+        JobPhase::Validating => 4,
+        JobPhase::Staging => 5,
+        JobPhase::CommittingSystem => 6,
+        JobPhase::RestartingAgent => 7,
+        JobPhase::Complete => 8,
         JobPhase::Failed => u8::MAX,
     }
-}
-
-fn failed_required_user_reinstalled(
-    recorded: Option<bool>,
-    explicit: Option<bool>,
-) -> Option<bool> {
-    explicit.or(recorded)
 }
 
 fn capulus_lock(product: &str) -> Result<crate::InvocationLock> {
@@ -844,24 +725,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_jobs_preserve_only_explicit_user_reinstall_outcomes() {
-        assert_eq!(failed_required_user_reinstalled(None, None), None);
-        assert_eq!(
-            failed_required_user_reinstalled(Some(true), None),
-            Some(true)
-        );
-        assert_eq!(
-            failed_required_user_reinstalled(None, Some(false)),
-            Some(false)
-        );
-    }
-
-    #[test]
     fn coordinator_startup_cleans_terminal_state_without_cleaning_a_live_job() {
         let active = ActiveJob {
             job: JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap(),
             version: semver::Version::new(1, 2, 3),
-            required_uid: Some(1000),
         };
         let mut status = RedeployJob {
             job: active.job,
@@ -872,7 +739,6 @@ mod tests {
             detail: String::new(),
             system_committed: true,
             rollback_succeeded: None,
-            required_user_reinstalled: None,
         };
         assert_eq!(
             startup_disposition(Some((&active, &status))),
@@ -881,9 +747,9 @@ mod tests {
         status.phase = JobPhase::Complete;
         assert_eq!(
             startup_disposition(Some((&active, &status))),
-            StartupDisposition::ClearAndCleanup(active.job)
+            StartupDisposition::Clear(active.job)
         );
-        assert_eq!(startup_disposition(None), StartupDisposition::Cleanup);
+        assert_eq!(startup_disposition(None), StartupDisposition::None);
         assert_eq!(
             monitored_job_state(Some(&active), active.job),
             MonitoredJobState::Active
@@ -899,28 +765,5 @@ mod tests {
             monitored_job_state(None, active.job),
             MonitoredJobState::Inactive
         );
-    }
-
-    #[test]
-    fn cleanup_retries_after_build_lock_contention() {
-        let mut attempts = 0;
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap()
-            .block_on(cleanup_until_available_with(
-                || {
-                    attempts += 1;
-                    Ok(if attempts == 1 {
-                        CleanupDisposition::Busy
-                    } else {
-                        CleanupDisposition::Complete
-                    })
-                },
-                Duration::ZERO,
-            ))
-            .unwrap();
-
-        assert_eq!(attempts, 2);
     }
 }
