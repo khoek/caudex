@@ -31,4 +31,4 @@ lto = "fat"
 debug = true
 
 [patch.crates-io]
-console = { git = "https://github.com/khoek/console.git", branch = "ansi-strip-osc8-tmux" }
+console = { git = "https://github.com/console-rs/console.git", tag = "0.16.5" }
