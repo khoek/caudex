@@ -118,8 +118,8 @@ impl ManagedBuild {
         );
         // Cargo has copied the executable into install_root. Its shared target tree is
         // disposable, including after a failed build. Keep only downloaded dependencies.
-        let cleanup_result = remove_build_output(
-            self.build_account_command("/usr/bin/rm"),
+        let cleanup_result = clear_build_output(
+            self.build_account_command("/usr/bin/find"),
             &self.account.target_home,
         );
         self.remove_registry_secrets()?;
@@ -302,8 +302,21 @@ impl ManagedBuild {
     }
 }
 
-fn remove_build_output(mut command: Command, target: &Path) -> Result<()> {
-    command.args(["-rf", "--"]).arg(target);
+fn clear_build_output(mut command: Command, target: &Path) -> Result<()> {
+    // The parent is root-owned and deliberately not writable by the builder.
+    // Remove contents while preserving the protected directory entry itself.
+    command.arg(target).args([
+        "-mindepth",
+        "1",
+        "-maxdepth",
+        "1",
+        "-exec",
+        "/usr/bin/rm",
+        "-rf",
+        "--",
+        "{}",
+        "+",
+    ]);
     run_with_deadline(
         &mut command,
         Duration::from_secs(120),
@@ -487,12 +500,20 @@ mod tests {
             std::fs::create_dir(directory.path().join(name)).unwrap();
             std::fs::write(directory.path().join(name).join("artifact"), b"data").unwrap();
         }
-        super::remove_build_output(
-            std::process::Command::new("/usr/bin/rm"),
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        super::clear_build_output(
+            std::process::Command::new("/usr/bin/find"),
             &directory.path().join("target"),
         )
         .unwrap();
-        assert!(!directory.path().join("target").exists());
+        assert!(
+            std::fs::read_dir(directory.path().join("target"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         for name in ["install", "cache"] {
             assert_eq!(
                 std::fs::read(directory.path().join(name).join("artifact")).unwrap(),

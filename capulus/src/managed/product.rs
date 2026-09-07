@@ -82,7 +82,7 @@ impl Default for ManagedRedeployOptions {
     fn default() -> Self {
         Self {
             build_timeout: Duration::from_secs(30 * 60),
-            maximum_tasks: 512,
+            maximum_tasks: 4096,
         }
     }
 }
