@@ -1,5 +1,5 @@
 use std::os::unix::process::CommandExt;
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -114,7 +114,27 @@ impl UserProgramUpdate {
         if rustix::process::geteuid().is_root() {
             bail!("a user-program update must not run as root");
         }
-        let mut command = self.command();
+        let target = tempfile::Builder::new()
+            .prefix("capulus-build-")
+            .tempdir_in(&self.cargo_root)
+            .context("failed to create temporary Cargo build directory")?;
+        let result = self.install_in(target.path(), cancellation);
+        let location = target.path().display().to_string();
+        match (result, target.close()) {
+            (result, Ok(())) => result,
+            (Ok(()), Err(error)) => Err(error).with_context(|| {
+                format!(
+                    "user CLI was installed, but build output could not be removed from {location}"
+                )
+            }),
+            (Err(error), Err(cleanup)) => Err(error.context(format!(
+                "build output could not be removed from {location}: {cleanup}"
+            ))),
+        }
+    }
+
+    fn install_in(&self, target: &Path, cancellation: Cancellation) -> Result<()> {
+        let mut command = self.command(target);
         command.process_group(0);
         let mut child = command.spawn().with_context(|| {
             format!("failed to start Cargo while updating {}", self.cargo_binary)
@@ -149,7 +169,7 @@ impl UserProgramUpdate {
         }
     }
 
-    fn command(&self) -> Command {
+    fn command(&self, target: &Path) -> Command {
         let mut command = Command::new(self.cargo_root.join("bin/cargo"));
         command
             .args(["install", "--locked", "--force", "--version"])
@@ -159,7 +179,8 @@ impl UserProgramUpdate {
             .arg("--root")
             .arg(&self.cargo_root)
             .arg("--target-dir")
-            .arg(self.cargo_root.join("target"));
+            .arg(target)
+            .env("CARGO_TARGET_DIR", target);
         if let Some(registry) = &self.registry {
             command.args(["--registry", registry]);
         }
@@ -205,6 +226,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_build_output_is_removed_after_success_and_failure() {
+        for status in [0, 7] {
+            let directory = tempfile::tempdir().unwrap();
+            let bin = directory.path().join("bin");
+            fs::create_dir(&bin).unwrap();
+            let cargo = bin.join("cargo");
+            fs::write(&cargo, format!(
+                "#!/bin/sh\nmkdir -p \"$CARGO_TARGET_DIR/release\"\nprintf artifact > \"$CARGO_TARGET_DIR/release/output\"\nprintf '%s' \"$CARGO_TARGET_DIR\" > \"$(dirname \"$0\")/used-target\"\nexit {status}\n"
+            )).unwrap();
+            fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+            let update = UserProgramUpdateOptions {
+                package: "aegis-tool".into(),
+                cargo_binary: "aegis".into(),
+                version: "1.2.3".into(),
+                cargo_root: directory.path().to_path_buf(),
+                ..UserProgramUpdateOptions::default()
+            }
+            .validate()
+            .unwrap();
+            let result = update.install(Cancellation::passive());
+            assert_eq!(result.is_ok(), status == 0);
+            let target = fs::read_to_string(bin.join("used-target")).unwrap();
+            assert!(!Path::new(&target).exists());
+            assert!(cargo.exists());
+        }
+    }
+
+    #[test]
     fn update_command_installs_one_exact_binary() {
         let update = UserProgramUpdateOptions {
             package: "aegis-tool".to_string(),
@@ -216,7 +265,7 @@ mod tests {
         }
         .validate()
         .unwrap();
-        let command = update.command();
+        let command = update.command(Path::new("/home/example/.cargo/capulus-build-example"));
         assert_eq!(command.get_program(), "/home/example/.cargo/bin/cargo");
         let arguments = command
             .get_args()
@@ -236,7 +285,7 @@ mod tests {
                 "--root",
                 "/home/example/.cargo",
                 "--target-dir",
-                "/home/example/.cargo/target",
+                "/home/example/.cargo/capulus-build-example",
                 "--registry",
                 "hoek-deus",
             ]
