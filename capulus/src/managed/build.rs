@@ -116,7 +116,15 @@ impl ManagedBuild {
             product.build_timeout(),
             "compile managed Cargo release",
         );
+        // Cargo has copied the executable into install_root. Its shared target tree is
+        // disposable, including after a failed build. Keep only downloaded dependencies.
+        let cleanup_result = remove_build_output(
+            self.build_account_command("/usr/bin/rm"),
+            &self.account.target_home,
+        );
         self.remove_registry_secrets()?;
+        cleanup_result
+            .context("Cargo build finished, but its build output could not be removed")?;
         result?;
         let artifacts = BuildArtifacts {
             binary_directory: self.install_root.join("bin"),
@@ -294,6 +302,16 @@ impl ManagedBuild {
     }
 }
 
+fn remove_build_output(mut command: Command, target: &Path) -> Result<()> {
+    command.args(["-rf", "--"]).arg(target);
+    run_with_deadline(
+        &mut command,
+        Duration::from_secs(120),
+        "clean managed Cargo build output",
+    )?;
+    Ok(())
+}
+
 pub(super) fn acquire_managed_build_lock() -> Result<crate::InvocationLock> {
     ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
     ensure_root_directory(Path::new(GLOBAL_BUILD_LOCK_ROOT), 0o700)?;
@@ -462,6 +480,27 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cleanup_removes_build_output_but_preserves_install_and_download_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["target", "install", "cache"] {
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+            std::fs::write(directory.path().join(name).join("artifact"), b"data").unwrap();
+        }
+        super::remove_build_output(
+            std::process::Command::new("/usr/bin/rm"),
+            &directory.path().join("target"),
+        )
+        .unwrap();
+        assert!(!directory.path().join("target").exists());
+        for name in ["install", "cache"] {
+            assert_eq!(
+                std::fs::read(directory.path().join(name).join("artifact")).unwrap(),
+                b"data"
+            );
+        }
+    }
+
     use super::*;
     use crate::managed::CargoRegistry;
 

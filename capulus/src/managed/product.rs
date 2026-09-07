@@ -465,6 +465,7 @@ impl ManagedProduct {
              \n\
              [Service]\n\
              Type=exec\n\
+             Slice={}.slice\n\
              User=root\n\
              Group=root\n\
              UMask=0077\n\
@@ -481,6 +482,7 @@ impl ManagedProduct {
              [Install]\n\
             WantedBy=multi-user.target\n",
             self.service.description,
+            self.product,
             quote_systemd_path(&self.program.installed_path),
             arguments,
             self.service.restart_delay.as_secs(),
@@ -919,6 +921,7 @@ mod tests {
         assert!(!text.contains("RuntimeDirectoryMode=0755"));
         assert!(text.contains("RuntimeDirectoryPreserve=yes"));
         assert!(text.contains("StateDirectory=auc\n"));
+        assert!(text.contains("Slice=auc.slice\n"));
         assert!(text.contains("ReadWritePaths=\"/var/lib/auc\" \"/var/lib/capulus\""));
         assert!(text.contains("StateDirectoryMode=0700"));
         assert!(text.contains("DeviceAllow=\"/dev/uhid\" rw"));
