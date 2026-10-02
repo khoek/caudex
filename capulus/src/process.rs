@@ -15,6 +15,161 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct CaptureOptions {
+    pub timeout: std::time::Duration,
+    pub max_output_bytes: u64,
+    pub cancellation: crate::Cancellation,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            timeout: std::time::Duration::from_secs(60),
+            max_output_bytes: 16 * 1024 * 1024,
+            cancellation: crate::Cancellation::passive(),
+        }
+    }
+}
+
+pub struct CaptureConfig(CaptureOptions);
+
+impl CaptureOptions {
+    pub fn validate(self) -> Result<CaptureConfig> {
+        anyhow::ensure!(!self.timeout.is_zero(), "command timeout must be positive");
+        anyhow::ensure!(
+            self.max_output_bytes > 0,
+            "command output limit must be positive"
+        );
+        Ok(CaptureConfig(self))
+    }
+}
+
+impl CaptureConfig {
+    /// Capture a child and its descendants with bounded output and a deadline.
+    pub fn run(&self, command: &mut Command, input: Option<&[u8]>) -> Result<CommandOutput> {
+        self.execute(command, input, false)
+    }
+
+    /// Mirror both child output streams to stderr while retaining bounded diagnostics.
+    /// The caller must suspend any interactive renderer before calling this method.
+    pub fn run_streaming(
+        &self,
+        command: &mut Command,
+        input: Option<&[u8]>,
+    ) -> Result<CommandOutput> {
+        self.execute(command, input, true)
+    }
+
+    fn execute(
+        &self,
+        command: &mut Command,
+        input: Option<&[u8]>,
+        streaming: bool,
+    ) -> Result<CommandOutput> {
+        use std::io::{Read, Seek};
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+
+        self.0.cancellation.check()?;
+        let mut stdin = tempfile::tempfile()?;
+        stdin.write_all(input.unwrap_or_default())?;
+        stdin.rewind()?;
+        let mut stdout = tempfile::tempfile()?;
+        let mut stderr = tempfile::tempfile()?;
+        command
+            .process_group(0)
+            .stdin(stdin)
+            .stdout(stdout.try_clone()?)
+            .stderr(stderr.try_clone()?);
+        let mut child = CapturedChild(command.spawn().context("failed to start subprocess")?);
+        let started = Instant::now();
+        let mut positions = [0, 0];
+        let status = loop {
+            if streaming {
+                mirror_output([&stdout, &stderr], &mut positions)?;
+            }
+            self.0.cancellation.check()?;
+            anyhow::ensure!(
+                started.elapsed() < self.0.timeout,
+                "subprocess deadline exceeded after {:?}",
+                self.0.timeout
+            );
+            anyhow::ensure!(
+                stdout.metadata()?.len() <= self.0.max_output_bytes
+                    && stderr.metadata()?.len() <= self.0.max_output_bytes,
+                "subprocess output limit exceeded"
+            );
+            if let Some(status) = child.0.try_wait()? {
+                break status;
+            }
+            self.0.cancellation.sleep(Duration::from_millis(50))?;
+        };
+        // Descendants must not outlive the captured command or continue writing its output.
+        drop(child);
+        if streaming {
+            while positions[0] < stdout.metadata()?.len() || positions[1] < stderr.metadata()?.len()
+            {
+                self.0.cancellation.check()?;
+                mirror_output([&stdout, &stderr], &mut positions)?;
+            }
+        }
+        stdout.rewind()?;
+        stderr.rewind()?;
+        let mut out = String::new();
+        let mut err = String::new();
+        stdout
+            .take(self.0.max_output_bytes + 1)
+            .read_to_string(&mut out)?;
+        stderr
+            .take(self.0.max_output_bytes + 1)
+            .read_to_string(&mut err)?;
+        anyhow::ensure!(
+            out.len() as u64 <= self.0.max_output_bytes
+                && err.len() as u64 <= self.0.max_output_bytes,
+            "subprocess output limit exceeded"
+        );
+        Ok(CommandOutput {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    }
+}
+
+fn mirror_output(files: [&std::fs::File; 2], positions: &mut [u64; 2]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut buffer = [0; 8192];
+    let mut output = io::stderr().lock();
+    for (file, position) in files.into_iter().zip(positions) {
+        // Limit work per tick so a continuously writing child cannot postpone cancellation.
+        for _ in 0..16 {
+            let count = file.read_at(&mut buffer, *position)?;
+            if count == 0 {
+                break;
+            }
+            output.write_all(&buffer[..count])?;
+            *position += count as u64;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+struct CapturedChild(std::process::Child);
+
+impl Drop for CapturedChild {
+    fn drop(&mut self) {
+        if let Ok(pid) = i32::try_from(self.0.id()) {
+            // The child creates its own process group before exec; a negative PID targets that group.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.0.wait();
+    }
+}
+
 pub fn ensure_command_available(program: &str) -> Result<()> {
     let output = Command::new(program)
         .arg("--version")
@@ -226,6 +381,94 @@ fn truncate_ellipsis(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::process::Command;
+
+    #[test]
+    fn bounded_capture_transmits_input_and_preserves_exit_status() {
+        let output = super::CaptureOptions::default()
+            .validate()
+            .unwrap()
+            .run(
+                Command::new("sh").args(["-c", "cat; printf diagnostic >&2; exit 7"]),
+                Some(b"payload\n"),
+            )
+            .unwrap();
+        assert_eq!(output.stdout, "payload\n");
+        assert_eq!(output.stderr, "diagnostic");
+        assert_eq!(output.status.code(), Some(7));
+        let error = super::CaptureOptions {
+            max_output_bytes: 32,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap()
+        .run(Command::new("head").args(["-c", "1024", "/dev/zero"]), None)
+        .unwrap_err();
+        assert!(error.to_string().contains("output limit"));
+    }
+
+    #[test]
+    fn capture_deadline_kills_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("escaped");
+        let error = super::CaptureOptions {
+            timeout: std::time::Duration::from_millis(100),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap()
+        .run(
+            Command::new("sh")
+                .args(["-c", "(sleep 0.4; touch \"$1\") & wait", "test"])
+                .arg(&marker),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!marker.exists(), "descendant survived its command deadline");
+    }
+
+    #[test]
+    fn capture_cancellation_remains_typed() {
+        if std::env::var_os("CAPULUS_TEST_CAPTURE_SIGNAL").is_some() {
+            let cancellation = crate::Cancellation::install().unwrap();
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGINT);
+                }
+            });
+            let error = super::CaptureOptions {
+                cancellation,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap()
+            .run(Command::new("sleep").arg("30"), None)
+            .unwrap_err()
+            .context("operation stopped");
+            assert!(crate::error_is_cancelled(&error));
+            return;
+        }
+        let result = super::CaptureOptions {
+            timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap()
+        .run(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::capture_cancellation_remains_typed",
+                    "--nocapture",
+                ])
+                .env("CAPULUS_TEST_CAPTURE_SIGNAL", "1"),
+            None,
+        )
+        .unwrap();
+        assert!(result.status.success(), "{}", result.stderr);
+    }
 
     use super::{render_command, require_success, run_with_input};
 

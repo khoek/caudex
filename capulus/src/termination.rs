@@ -44,7 +44,7 @@ impl Termination for CliTermination {
                 u8::try_from(INTERRUPTED_EXIT_CODE).expect("SIGINT exit code fits in one byte"),
             ),
             Err(error) => {
-                Self::report_error(ui.as_ref(), &error.to_string());
+                Self::report_error(ui.as_ref(), &format!("{error:#}"));
                 ExitCode::FAILURE
             }
         }
