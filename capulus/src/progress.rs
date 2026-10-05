@@ -109,7 +109,7 @@ struct TerminalCapabilities {
 impl TerminalCapabilities {
     fn detect() -> Self {
         Self {
-            stderr: io::stderr().is_terminal(),
+            stderr: !indicatif::ProgressDrawTarget::stderr().is_hidden(),
             stdout: io::stdout().is_terminal(),
         }
     }
@@ -298,10 +298,12 @@ impl Ui {
 
     fn write_line(&self, line: &str) {
         match &self.inner.progress {
-            Some(progress) => {
-                let _ = progress.println(line);
+            Some(progress) if !progress.is_hidden() => {
+                if progress.println(line).is_err() {
+                    self.inner.output.write_line(line);
+                }
             }
-            None => self.inner.output.write_line(line),
+            _ => self.inner.output.write_line(line),
         }
     }
 
@@ -1246,6 +1248,21 @@ mod tests {
             .expect("plain UI options"),
             output,
         )
+    }
+
+    #[test]
+    fn hidden_draw_target_never_swallows_diagnostics() {
+        let output = Arc::new(BufferOutput::default());
+        let mut ui = plain_ui(Arc::clone(&output), Duration::ZERO, Duration::from_secs(1));
+        Arc::get_mut(&mut ui.inner).unwrap().progress = Some(Arc::new(
+            MultiProgress::with_draw_target(ProgressDrawTarget::hidden()),
+        ));
+        ui.error("setup failed");
+        ui.warn("resources retained");
+        assert_eq!(
+            *output.lines.lock().unwrap(),
+            ["error: setup failed", "warning: resources retained"]
+        );
     }
 
     #[test]
