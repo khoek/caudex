@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::Cancellation;
 
@@ -140,6 +140,8 @@ pub struct Ui {
 struct UiInner {
     options: ValidatedUiOptions,
     progress: Option<Arc<MultiProgress>>,
+    draw_target: fn() -> ProgressDrawTarget,
+    suspensions: Mutex<usize>,
     output: Arc<dyn LineOutput>,
     cancellation: Cancellation,
 }
@@ -162,12 +164,15 @@ impl Ui {
             CancellationMode::Signal => Cancellation::install()?,
             CancellationMode::Passive => Cancellation::passive(),
         };
+        let draw_target = ProgressDrawTarget::stderr;
         let progress = matches!(options.progress, ResolvedProgressMode::Interactive)
-            .then(|| Arc::new(MultiProgress::new()));
+            .then(|| Arc::new(MultiProgress::with_draw_target(draw_target())));
         Ok(Self {
             inner: Arc::new(UiInner {
                 options,
                 progress,
+                draw_target,
+                suspensions: Mutex::new(0),
                 output: Arc::new(StderrOutput),
                 cancellation,
             }),
@@ -262,9 +267,18 @@ impl Ui {
     }
 
     pub fn suspend<T>(&self, operation: impl FnOnce() -> T) -> T {
-        match &self.inner.progress {
-            Some(progress) => progress.suspend(operation),
-            None => operation(),
+        if let Some(progress) = &self.inner.progress {
+            let mut depth = self.inner.suspensions.lock().expect("suspension lock");
+            if *depth == 0 {
+                let _ = progress.clear();
+                progress.set_draw_target(ProgressDrawTarget::hidden());
+            }
+            *depth += 1;
+            drop(depth);
+            let _restore = RestoreProgress(&self.inner);
+            operation()
+        } else {
+            operation()
         }
     }
 
@@ -312,10 +326,26 @@ impl Ui {
         Self {
             inner: Arc::new(UiInner {
                 progress: None,
+                draw_target: ProgressDrawTarget::hidden,
+                suspensions: Mutex::new(0),
                 options,
                 output,
                 cancellation: Cancellation,
             }),
+        }
+    }
+}
+
+struct RestoreProgress<'a>(&'a UiInner);
+
+impl Drop for RestoreProgress<'_> {
+    fn drop(&mut self) {
+        let mut depth = self.0.suspensions.lock().expect("suspension lock");
+        *depth -= 1;
+        if *depth == 0
+            && let Some(progress) = &self.0.progress
+        {
+            progress.set_draw_target((self.0.draw_target)());
         }
     }
 }
@@ -1262,6 +1292,53 @@ mod tests {
         assert_eq!(
             *output.lines.lock().unwrap(),
             ["error: setup failed", "warning: resources retained"]
+        );
+    }
+
+    #[test]
+    fn nested_terminal_handoffs_allow_reporting_and_restore_after_failure() {
+        let output = Arc::new(BufferOutput::default());
+        let mut ui = plain_ui(Arc::clone(&output), Duration::ZERO, Duration::from_secs(1));
+        let inner = Arc::get_mut(&mut ui.inner).unwrap();
+        inner.options.progress = ResolvedProgressMode::Interactive;
+        inner.draw_target = || ProgressDrawTarget::term_like(Box::new(InMemoryTerm::new(8, 100)));
+        inner.progress = Some(Arc::new(MultiProgress::with_draw_target((inner
+            .draw_target)(
+        ))));
+        let (done, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let progress = ui.inner.progress.as_ref().unwrap();
+            let task = ui
+                .task(TaskOptions {
+                    label: "Enrolling remote host".into(),
+                    visibility: TaskVisibility::Immediate,
+                    ..Default::default()
+                })
+                .unwrap();
+            ui.suspend(|| {
+                ui.info("child output follows");
+                task.set_phase("installing");
+                ui.suspend(|| {
+                    assert!(progress.is_hidden());
+                    ui.warn("inner handoff");
+                    task.finish_and_clear();
+                });
+                assert!(progress.is_hidden());
+            });
+            assert!(!progress.is_hidden());
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ui.suspend(|| panic!("child failed"));
+            }));
+            assert!(failed.is_err());
+            assert!(!progress.is_hidden());
+            done.send(()).unwrap();
+        });
+        received
+            .recv_timeout(Duration::from_secs(3))
+            .expect("terminal handoff deadlocked");
+        assert_eq!(
+            *output.lines.lock().unwrap(),
+            ["info: child output follows", "warning: inner handoff"]
         );
     }
 
