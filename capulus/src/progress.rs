@@ -223,14 +223,7 @@ impl Ui {
         let renderer = match self.inner.options.progress {
             ResolvedProgressMode::Interactive => Some(spawn_interactive_renderer(
                 Arc::clone(&shared),
-                Arc::clone(
-                    self.inner
-                        .progress
-                        .as_ref()
-                        .expect("interactive UI owns a MultiProgress"),
-                ),
-                self.inner.options.visibility_delay,
-                self.inner.options.color,
+                self.clone(),
             )),
             ResolvedProgressMode::Plain => Some(spawn_plain_renderer(
                 Arc::clone(&shared),
@@ -313,9 +306,7 @@ impl Ui {
     fn write_line(&self, line: &str) {
         match &self.inner.progress {
             Some(progress) if !progress.is_hidden() => {
-                if progress.println(line).is_err() {
-                    self.inner.output.write_line(line);
-                }
+                progress.suspend(|| self.inner.output.write_line(line));
             }
             _ => self.inner.output.write_line(line),
         }
@@ -601,16 +592,14 @@ fn join_renderer(renderer: Option<JoinHandle<()>>) {
     }
 }
 
-fn spawn_interactive_renderer(
-    shared: Arc<TaskShared>,
-    progress: Arc<MultiProgress>,
-    default_delay: Duration,
-    color: bool,
-) -> JoinHandle<()> {
+fn spawn_interactive_renderer(shared: Arc<TaskShared>, ui: Ui) -> JoinHandle<()> {
     thread::spawn(move || {
-        let delay = task_visibility_delay(&shared, default_delay);
+        let delay = task_visibility_delay(&shared, ui.inner.options.visibility_delay);
         if wait_until_visible_or_complete(&shared, delay) {
-            render_fast_interactive_completion(&shared, &progress);
+            let state = shared.state.lock().expect("task state lock");
+            if let Some(outcome) = state.outcome.as_ref() {
+                render_interactive_outcome(&ui, outcome, state.started.elapsed());
+            }
             return;
         }
 
@@ -621,8 +610,15 @@ fn spawn_interactive_renderer(
                 ProgressBar::new(total)
             }
         };
-        let bar = attach_progress_bar(&progress, bar, None);
-        bar.set_style(task_style(&state.options.kind, color));
+        let bar = attach_progress_bar(
+            ui.inner
+                .progress
+                .as_ref()
+                .expect("interactive UI owns a MultiProgress"),
+            bar,
+            None,
+        );
+        bar.set_style(task_style(&state.options.kind, ui.inner.options.color));
         bar.set_message(state.render_message(Instant::now()));
         bar.set_position(state.position);
         if matches!(state.options.kind, TaskKind::Indeterminate) {
@@ -637,7 +633,9 @@ fn spawn_interactive_renderer(
             if let Some(outcome) = state.outcome.clone() {
                 let elapsed = state.started.elapsed();
                 drop(state);
-                finish_interactive_bar(&bar, outcome, elapsed);
+                bar.disable_steady_tick();
+                bar.finish_and_clear();
+                render_interactive_outcome(&ui, &outcome, elapsed);
                 return;
             }
             let _ = shared
@@ -728,36 +726,16 @@ fn render_fast_completion(shared: &TaskShared, output: &dyn LineOutput) {
     }
 }
 
-fn render_fast_interactive_completion(shared: &TaskShared, progress: &MultiProgress) {
-    let state = shared.state.lock().expect("task state lock");
-    let elapsed = format_duration(state.started.elapsed());
-    let line = match state.outcome.as_ref() {
-        Some(TaskOutcome::Success(message)) => Some(format!("✓ {message} · {elapsed}")),
-        Some(TaskOutcome::Failure(message)) => Some(format!("✗ {message} · {elapsed}")),
-        Some(TaskOutcome::Abandoned(message)) => Some(format!("! {message} · {elapsed}")),
-        Some(TaskOutcome::Clear) | None => None,
+fn render_interactive_outcome(ui: &Ui, outcome: &TaskOutcome, elapsed: Duration) {
+    let elapsed = format_duration(elapsed);
+    let line = match outcome {
+        TaskOutcome::Success(message) => Some(format!("✓ {message} · {elapsed}")),
+        TaskOutcome::Failure(message) => Some(format!("✗ {message} · {elapsed}")),
+        TaskOutcome::Abandoned(message) => Some(format!("! {message} · {elapsed}")),
+        TaskOutcome::Clear => None,
     };
     if let Some(line) = line {
-        let _ = progress.println(line);
-    }
-}
-
-fn finish_interactive_bar(bar: &ProgressBar, outcome: TaskOutcome, elapsed: Duration) {
-    bar.disable_steady_tick();
-    match outcome {
-        TaskOutcome::Success(message) => {
-            bar.set_style(message_style());
-            bar.finish_with_message(format!("✓ {message} · {}", format_duration(elapsed)));
-        }
-        TaskOutcome::Failure(message) => {
-            bar.set_style(message_style());
-            bar.abandon_with_message(format!("✗ {message} · {}", format_duration(elapsed)));
-        }
-        TaskOutcome::Abandoned(message) => {
-            bar.set_style(message_style());
-            bar.abandon_with_message(format!("! {message} · {}", format_duration(elapsed)));
-        }
-        TaskOutcome::Clear => bar.finish_and_clear(),
+        ui.write_line(&line);
     }
 }
 
@@ -1020,8 +998,10 @@ impl LiveGroup {
             .take()
         {
             footer.disable_steady_tick();
-            footer.set_style(message_style());
-            footer.finish_with_message(format!("{glyph} {message} · {elapsed}"));
+            footer.finish_and_clear();
+            self.inner
+                .ui
+                .write_line(&format!("{glyph} {message} · {elapsed}"));
         } else if matches!(
             self.inner.ui.inner.options.progress,
             ResolvedProgressMode::Plain
@@ -1161,8 +1141,8 @@ impl LiveRow {
             .take()
         {
             bar.disable_steady_tick();
-            bar.set_style(message_style());
-            bar.finish_with_message(match &self.inner.presentation {
+            bar.finish_and_clear();
+            self.inner.ui.write_line(&match &self.inner.presentation {
                 LiveRowPresentation::Labeled(label) => {
                     format!("{glyph} {label} · {message} · {elapsed}")
                 }
@@ -1216,10 +1196,6 @@ fn live_rendered_row_style(color: bool) -> ProgressStyle {
     })
     .expect("rendered live-row template")
     .tick_strings(SPINNER_TICKS)
-}
-
-fn message_style() -> ProgressStyle {
-    ProgressStyle::with_template("{msg}").expect("task message template")
 }
 
 pub fn format_duration(duration: Duration) -> String {

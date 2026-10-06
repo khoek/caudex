@@ -1,6 +1,6 @@
 [package]
 name = "capulus"
-version = "0.6.11"
+version = "0.6.12"
 edition.workspace = true
 license.workspace = true
 description = "Shared support for Rust command-line tools."
@@ -48,3 +48,4 @@ zbus = { version = "5", default-features = false, features = ["tokio"], optional
 
 [dev-dependencies]
 indicatif = { version = "0.18", features = ["in_memory"] }
+vt100 = "0.16"
