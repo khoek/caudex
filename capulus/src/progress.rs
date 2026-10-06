@@ -11,6 +11,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use crate::Cancellation;
 
+mod terminal;
+
 const TICK_INTERVAL: Duration = Duration::from_millis(90);
 const SPINNER_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -164,7 +166,7 @@ impl Ui {
             CancellationMode::Signal => Cancellation::install()?,
             CancellationMode::Passive => Cancellation::passive(),
         };
-        let draw_target = ProgressDrawTarget::stderr;
+        let draw_target = terminal::draw_target;
         let progress = matches!(options.progress, ResolvedProgressMode::Interactive)
             .then(|| Arc::new(MultiProgress::with_draw_target(draw_target())));
         Ok(Self {

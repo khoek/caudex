@@ -1,6 +1,6 @@
 [package]
 name = "capulus"
-version = "0.6.12"
+version = "0.6.13"
 edition.workspace = true
 license.workspace = true
 description = "Shared support for Rust command-line tools."
@@ -25,6 +25,7 @@ managed-system = [
 anyhow = "1"
 ciborium = { version = "0.2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+console = "0.16"
 dialoguer = "0.12"
 dirs = "7"
 fs2 = "0.4"

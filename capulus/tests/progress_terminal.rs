@@ -78,7 +78,7 @@ struct TerminalChild {
 }
 
 impl TerminalChild {
-    fn start() -> Self {
+    fn start(mut command: Command) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let size = libc::winsize {
@@ -102,9 +102,7 @@ impl TerminalChild {
         );
         let master = unsafe { File::from_raw_fd(master) };
         let slave = unsafe { File::from_raw_fd(slave) };
-        let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["terminal_fixture", "--exact", "--nocapture"])
             .env(FIXTURE, "1")
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -147,9 +145,7 @@ impl Drop for TerminalChild {
     }
 }
 
-#[test]
-fn permanent_output_and_child_prompt_have_real_line_boundaries_after_resize() {
-    let mut child = TerminalChild::start();
+fn capture_until_prompt(child: &mut TerminalChild) -> (vt100::Parser, Vec<u8>) {
     let mut parser = vt100::Parser::new(30, 100, 1000);
     let mut captured = Vec::new();
     let mut resized = false;
@@ -181,14 +177,23 @@ fn permanent_output_and_child_prompt_have_real_line_boundaries_after_resize() {
         }
         if parser.screen().contents().contains("PROMPT>") {
             assert!(resized);
-            assert_eq!(
-                parser.screen().cursor_position().1,
-                8,
-                "prompt did not start at column zero"
-            );
             break;
         }
     }
+    (parser, captured)
+}
+
+#[test]
+fn permanent_output_and_child_prompt_have_real_line_boundaries_after_resize() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["terminal_fixture", "--exact", "--nocapture"]);
+    let mut child = TerminalChild::start(command);
+    let (parser, captured) = capture_until_prompt(&mut child);
+    assert_eq!(
+        parser.screen().cursor_position().1,
+        8,
+        "prompt did not start at column zero"
+    );
     let text = String::from_utf8(captured).unwrap();
     for marker in ["TRANSIENT_OPERATION", "UPDATED_OPERATION"] {
         assert!(text.contains(marker), "terminal never rendered {marker}");
@@ -229,5 +234,80 @@ fn permanent_output_and_child_prompt_have_real_line_boundaries_after_resize() {
             !elapsed.contains('\x1b') && elapsed.len() < 30,
             "completion wrapped into later output: {message}"
         );
+    }
+}
+
+#[test]
+#[ignore = "requires the zellij executable"]
+fn zellij_scrollback_preserves_completed_lines_after_resize() {
+    struct Session(String);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            for operation in ["kill-session", "delete-session"] {
+                let _ = capulus::process::CaptureOptions {
+                    timeout: Duration::from_secs(5),
+                    ..Default::default()
+                }
+                .validate()
+                .unwrap()
+                .run(Command::new("zellij").args([operation, &self.0]), None);
+            }
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.kdl");
+    std::fs::write(
+        &config,
+        "pane_frames false\ndefault_layout \"compact\"\nshow_startup_tips false\nshow_release_notes false\n",
+    )
+    .unwrap();
+    let session = Session(format!("capulus-terminal-test-{}", std::process::id()));
+    let mut command = Command::new("zellij");
+    command
+        .arg("--config")
+        .arg(config)
+        .args(["attach", "--create", &session.0, "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["terminal_fixture", "--exact", "--nocapture"]);
+    let mut child = TerminalChild::start(command);
+    capture_until_prompt(&mut child);
+    let screen = capulus::process::CaptureOptions {
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    }
+    .validate()
+    .unwrap()
+    .run(
+        Command::new("zellij").args(["--session", &session.0, "action", "dump-screen", "--full"]),
+        None,
+    )
+    .unwrap();
+    assert!(screen.status.success(), "{}", screen.stderr);
+    for message in [
+        "info: FIRST",
+        "    SECOND",
+        "info: RESIZE_READY",
+        "ok: LAST",
+        "PROMPT>",
+    ] {
+        assert!(
+            screen.stdout.lines().any(|line| line.trim_end() == message),
+            "{message} lost its line boundary:\n{}",
+            screen.stdout
+        );
+    }
+    for (message, prefix) in [
+        ("FAST_COMPLETED", "✓ FAST_COMPLETED"),
+        ("SLOW_COMPLETED", "✓ SLOW_COMPLETED"),
+        ("ROW_COMPLETED", "✓ host · ROW_COMPLETED"),
+        ("GROUP_COMPLETED", "✓ GROUP_COMPLETED"),
+    ] {
+        let line = screen
+            .stdout
+            .lines()
+            .find(|line| line.contains(message))
+            .unwrap();
+        assert!(line.starts_with(prefix), "{line}");
+        assert_eq!(line.matches("COMPLETED").count(), 1, "{line}");
     }
 }
