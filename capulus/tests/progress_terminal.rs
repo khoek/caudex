@@ -52,6 +52,17 @@ fn terminal_fixture() {
         .unwrap()
         .finish("ROW_COMPLETED");
     group.finish("GROUP_COMPLETED");
+    let transient = ui
+        .task(TaskOptions {
+            label: "TRANSIENT_OPERATION".into(),
+            visibility: TaskVisibility::Immediate,
+            ..Default::default()
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    transient.set_phase("UPDATED_OPERATION");
+    std::thread::sleep(Duration::from_millis(150));
+    transient.finish_and_clear();
     ui.success("LAST");
     drop(group);
     drop(ui);
@@ -179,6 +190,19 @@ fn permanent_output_and_child_prompt_have_real_line_boundaries_after_resize() {
         }
     }
     let text = String::from_utf8(captured).unwrap();
+    for marker in ["TRANSIENT_OPERATION", "UPDATED_OPERATION"] {
+        assert!(text.contains(marker), "terminal never rendered {marker}");
+        assert!(
+            !parser.screen().contents().contains(marker),
+            "completed progress remained on screen: {marker}"
+        );
+    }
+    for marker in ["[start]", "[done]", "[phase]", "[wait]"] {
+        assert!(
+            !text.contains(marker),
+            "terminal used plain progress: {marker}"
+        );
+    }
     for line in [
         "info: FIRST",
         "    SECOND",
