@@ -173,3 +173,26 @@ boundary restores the installation.
 
 Shared Capulus state is root-owned mode 0700 unless a narrower validated boundary explicitly needs
 traversal. Product state modes never propagate to the shared roots.
+
+## macOS managed services
+
+macOS uses one launchd property list under `/Library/LaunchDaemons`, with named
+application and management sockets under `/private/var/run`. Socket paths are flat
+so activation does not depend on a runtime subdirectory surviving reboot. launchd
+starts them private; the agent verifies ownership before applying declared access.
+IPC authorization still uses kernel credentials and the requesting account's group membership.
+
+Programs live under `/Library/PrivilegedHelperTools`. State and ephemeral jobs use
+`/private/var/lib` and `/private/var/run`; the shared build account is a hidden,
+unprivileged Directory Services account. Service startup creates the declared
+product state directory without changing permissions on existing system parents.
+
+An upgrade has its own temporary launchd job, independent of the agent. Bounded
+build phases and a worker deadline replace systemd's runtime limit. launchd owns
+the worker's process group; completed property lists are reaped, including after
+an agent restart. Installation journals and protocol readiness gates are shared.
+
+Linux cgroup task limits and network ordering are Linux-only configuration fields.
+Strict filesystem/device hardening is rejected on macOS; it is never silently
+translated into a weaker policy. Product daemons must tolerate unavailable networks
+and implement retries. Native launchd lifecycle testing is required before release.

@@ -3,7 +3,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustix::net::sockopt::socket_peercred;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Semaphore};
@@ -118,12 +117,15 @@ async fn serve_connection<H: ManagementHandler>(
     handler: Arc<H>,
     rates: Arc<RequestRateLimiter>,
 ) -> Result<(), ManagementError> {
-    let credentials =
-        socket_peercred(&stream).map_err(|error| ManagementError::Io(error.into()))?;
+    let credentials = stream.peer_cred().map_err(ManagementError::Io)?;
     let peer = PeerCredentials {
-        pid: credentials.pid.as_raw_nonzero().get() as u32,
-        uid: credentials.uid.as_raw(),
-        gid: credentials.gid.as_raw(),
+        pid: credentials.pid().filter(|pid| *pid > 0).ok_or_else(|| {
+            ManagementError::Io(std::io::Error::other(
+                "local socket did not provide a peer PID",
+            ))
+        })? as u32,
+        uid: credentials.uid(),
+        gid: credentials.gid(),
     };
     let allowed = rates.allow(peer.uid).await;
     let request: RequestEnvelope = decode(&read_frame(&mut stream).await?)?;

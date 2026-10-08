@@ -14,7 +14,9 @@ const INSTALLATION_SCHEMA_MAJOR: u16 = 2;
 const MINIMUM_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
 const MAXIMUM_BUILD_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const REDEPLOY_FIXED_BUDGET: Duration = Duration::from_secs(35 * 60);
+#[cfg(target_os = "linux")]
 const MINIMUM_TASKS: u64 = 16;
+#[cfg(target_os = "linux")]
 const MAXIMUM_TASKS: u64 = 32_768;
 
 #[derive(Clone, Debug)]
@@ -37,6 +39,7 @@ impl ManagedProductOptions {
         if !(MINIMUM_BUILD_TIMEOUT..=MAXIMUM_BUILD_TIMEOUT).contains(&self.redeploy.build_timeout) {
             return Err(ProductValidationError::BuildTimeout);
         }
+        #[cfg(target_os = "linux")]
         if !(MINIMUM_TASKS..=MAXIMUM_TASKS).contains(&self.redeploy.maximum_tasks) {
             return Err(ProductValidationError::MaximumTasks);
         }
@@ -46,6 +49,10 @@ impl ManagedProductOptions {
             .checked_add(REDEPLOY_FIXED_BUDGET)
             .ok_or(ProductValidationError::RedeployRuntime)?;
         validate_service(&self.product, &self.service)?;
+        #[cfg(target_os = "macos")]
+        if matches!(self.service.hardening, ServiceHardening::Strict { .. }) {
+            return Err(ProductValidationError::UnsupportedServiceHardening);
+        }
         validate_socket(&self.product, "application", &self.application_socket)?;
         validate_socket(&self.product, "capulus", &self.management_socket)?;
         match (
@@ -75,6 +82,7 @@ impl ManagedProductOptions {
 #[derive(Clone, Debug)]
 pub struct ManagedRedeployOptions {
     pub build_timeout: Duration,
+    #[cfg(target_os = "linux")]
     pub maximum_tasks: u64,
 }
 
@@ -82,6 +90,7 @@ impl Default for ManagedRedeployOptions {
     fn default() -> Self {
         Self {
             build_timeout: Duration::from_secs(30 * 60),
+            #[cfg(target_os = "linux")]
             maximum_tasks: 4096,
         }
     }
@@ -98,7 +107,7 @@ impl ManagedProgramOptions {
     fn validate(self) -> Result<ManagedProgram, ProductValidationError> {
         validate_identifier("Cargo binary", &self.cargo_binary)?;
         validate_absolute_path(&self.installed_path)?;
-        if self.installed_path.parent() != Some(Path::new("/usr/local/bin")) {
+        if self.installed_path.parent() != Some(Path::new(super::layout::PROGRAM_DIRECTORY)) {
             return Err(ProductValidationError::BinaryDestination(
                 self.installed_path,
             ));
@@ -149,8 +158,12 @@ impl ManagedProgram {
     }
 
     pub fn trusted_installed_path(&self) -> Result<&Path> {
-        for directory in ["/", "/usr", "/usr/local", "/usr/local/bin"] {
-            let path = Path::new(directory);
+        for path in self
+            .installed_path
+            .parent()
+            .expect("validated program parent")
+            .ancestors()
+        {
             let metadata = fs::symlink_metadata(path).with_context(|| {
                 format!(
                     "failed to inspect managed-program directory {}",
@@ -159,7 +172,6 @@ impl ManagedProgram {
             })?;
             if !metadata.file_type().is_dir()
                 || metadata.uid() != 0
-                || metadata.gid() != 0
                 || metadata.permissions().mode() & 0o022 != 0
             {
                 bail!(
@@ -193,6 +205,7 @@ pub struct AgentServiceOptions {
     pub description: String,
     pub command: Vec<String>,
     pub restart_delay: Duration,
+    #[cfg(target_os = "linux")]
     pub network_required: bool,
     pub state_directory_mode: u32,
     pub hardening: ServiceHardening,
@@ -248,6 +261,7 @@ impl ManagedProduct {
         self.redeploy.build_timeout
     }
 
+    #[cfg(target_os = "linux")]
     pub fn maximum_tasks(&self) -> u64 {
         self.redeploy.maximum_tasks
     }
@@ -269,7 +283,7 @@ impl ManagedProduct {
     }
 
     pub fn service_name(&self) -> String {
-        format!("{}-agent.service", self.product)
+        super::layout::service_name(&self.product)
     }
 
     pub fn application_socket_name(&self) -> String {
@@ -281,6 +295,18 @@ impl ManagedProduct {
     }
 
     pub fn installation_manifest(&self) -> InstallationManifest {
+        #[cfg(target_os = "macos")]
+        {
+            self.launchd_manifest()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.systemd_manifest()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn systemd_manifest(&self) -> InstallationManifest {
         let service_name = self.service_name();
         let application_socket_name = self.application_socket_name();
         let management_socket_name = self.management_socket_name();
@@ -318,6 +344,85 @@ impl ManagedProduct {
                 service_name,
             ],
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn launchd_manifest(&self) -> InstallationManifest {
+        use super::service::{plist_prefix, xml_string};
+        let service = self.service_name();
+        let arguments = std::iter::once(self.program.installed_path.display().to_string())
+            .chain(self.program.command_prefix.iter().cloned())
+            .chain(self.service.command.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut contents = plist_prefix(service.trim_end_matches(".plist"), &arguments);
+        contents.push_str(&format!(
+            "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\
+             <key>ThrottleInterval</key><integer>{}</integer>\
+             <key>ExitTimeOut</key><integer>30</integer>\
+             <key>ProcessType</key><string>Interactive</string>\
+             <key>StandardOutPath</key>{}<key>StandardErrorPath</key>{}\
+             <key>Sockets</key><dict>",
+            self.service.restart_delay.as_secs(),
+            xml_string(&format!("/private/var/log/{}-agent.log", self.product)),
+            xml_string(&format!("/private/var/log/{}-agent.log", self.product)),
+        ));
+        for (name, socket) in [
+            ("application", &self.application_socket),
+            ("capulus", &self.management_socket),
+        ] {
+            // Access is widened only after the agent verifies ownership and applies the declared group.
+            contents.push_str(&format!(
+                "<key>{name}</key><dict><key>SockPathName</key>{}\
+                 <key>SockType</key><string>stream</string><key>SockPathMode</key><integer>384</integer></dict>",
+                xml_string(&socket.path.display().to_string()),
+            ));
+        }
+        contents.push_str("</dict></dict></plist>\n");
+        InstallationManifest {
+            schema_major: INSTALLATION_SCHEMA_MAJOR,
+            product: self.product.clone(),
+            package: self.package.clone(),
+            version: self.version.clone(),
+            files: vec![
+                ManagedFile::Binary {
+                    source_name: self.program.cargo_binary.clone(),
+                    destination: self.program.installed_path.clone(),
+                    mode: 0o755,
+                },
+                ManagedFile::Text {
+                    destination: system_unit_path(&service),
+                    contents,
+                    mode: 0o644,
+                },
+            ],
+            enable_units: vec![service],
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn configure_native_runtime(&self) -> Result<()> {
+        super::account::prepare_state_parent()?;
+        super::account::ensure_root_directory(
+            &Path::new("/private/var/lib").join(&self.product),
+            self.service.state_directory_mode,
+        )?;
+        use std::os::unix::fs::FileTypeExt;
+        for socket in [&self.application_socket, &self.management_socket] {
+            let metadata = fs::symlink_metadata(&socket.path)?;
+            anyhow::ensure!(
+                metadata.file_type().is_socket() && metadata.uid() == 0,
+                "launchd socket is not owned by root: {}",
+                socket.path.display()
+            );
+            let gid = match &socket.group {
+                Some(name) => super::account::unix_group_gid(name)?
+                    .ok_or_else(|| anyhow::anyhow!("group {name} is missing"))?,
+                None => 0,
+            };
+            std::os::unix::fs::chown(&socket.path, Some(0), Some(gid))?;
+            fs::set_permissions(&socket.path, fs::Permissions::from_mode(socket.mode))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_release_manifest(
@@ -360,10 +465,11 @@ impl ManagedProduct {
             return Err(ProductValidationError::ManifestBinary);
         }
 
-        let service = self.service_name();
-        let management = self.management_socket_name();
-        let application = self.application_socket_name();
-        let expected_units = BTreeSet::from([service, management, application]);
+        let expected_units = self
+            .installation_manifest()
+            .enable_units
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let present_units = manifest
             .files
             .iter()
@@ -391,6 +497,7 @@ impl ManagedProduct {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn service_unit_contents(&self) -> String {
         let management_socket = self.management_socket_name();
         let application_socket = self.application_socket_name();
@@ -492,6 +599,7 @@ impl ManagedProduct {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn socket_unit_contents(&self, descriptor_name: &str, options: &SocketOptions) -> String {
         let group = options
             .group
@@ -560,7 +668,7 @@ impl InstallationManifest {
                 } => {
                     binary_count += 1;
                     validate_identifier("manifest binary", source_name)?;
-                    if destination.parent() != Some(Path::new("/usr/local/bin"))
+                    if destination.parent() != Some(Path::new(super::layout::PROGRAM_DIRECTORY))
                         || destination.file_name().and_then(|name| name.to_str())
                             != Some(source_name)
                     {
@@ -578,9 +686,9 @@ impl InstallationManifest {
                     let Some(name) = destination.file_name().and_then(|name| name.to_str()) else {
                         return Err(ProductValidationError::UnitDestination(destination.clone()));
                     };
-                    if destination.parent() != Some(Path::new("/etc/systemd/system"))
+                    if destination.parent() != Some(Path::new(super::layout::UNIT_DIRECTORY))
                         || !name.starts_with(&unit_prefix)
-                        || !(name.ends_with(".service") || name.ends_with(".socket"))
+                        || !super::layout::valid_unit_name(name)
                     {
                         return Err(ProductValidationError::UnitDestination(destination.clone()));
                     }
@@ -604,9 +712,7 @@ impl InstallationManifest {
             return Err(ProductValidationError::ManifestBinaryCount(binary_count));
         }
         for unit in &self.enable_units {
-            if !unit.starts_with(&unit_prefix)
-                || !(unit.ends_with(".service") || unit.ends_with(".socket"))
-            {
+            if !unit.starts_with(&unit_prefix) || !super::layout::valid_unit_name(unit) {
                 return Err(ProductValidationError::UnitName(unit.clone()));
             }
             if !destinations.contains(&system_unit_path(unit)) {
@@ -642,6 +748,9 @@ pub enum ManagedFile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProductValidationError {
+    #[error("strict filesystem/device service hardening is unavailable with launchd")]
+    UnsupportedServiceHardening,
+
     #[error("{field} must be a lowercase ASCII identifier: {value:?}")]
     Identifier { field: &'static str, value: String },
     #[error("managed program command prefix must contain at least one subcommand")]
@@ -652,7 +761,10 @@ pub enum ProductValidationError {
     MaximumTasks,
     #[error("managed redeploy runtime limit cannot be represented")]
     RedeployRuntime,
-    #[error("managed binary destination must be directly beneath /usr/local/bin: {0}")]
+    #[error(
+        "managed binary destination must be directly beneath {directory}: {0}",
+        directory = super::layout::PROGRAM_DIRECTORY
+    )]
     BinaryDestination(PathBuf),
     #[error("Cargo binary {cargo_name:?} does not match destination {destination}")]
     BinaryNameMismatch {
@@ -691,7 +803,7 @@ pub enum ProductValidationError {
     ManifestBinary,
     #[error("installation manifest must contain exactly one managed program, found {0}")]
     ManifestBinaryCount(usize),
-    #[error("installation manifest must contain exactly the service and both sockets")]
+    #[error("installation manifest must contain exactly the declared native service files")]
     MissingRequiredUnit,
     #[error("installation manifest unit files and enabled units differ")]
     UnitEnablement,
@@ -770,7 +882,13 @@ fn validate_socket(
     } else {
         "capulus.sock"
     };
-    let expected = Path::new("/run").join(product).join(filename);
+    #[cfg(target_os = "linux")]
+    let expected = Path::new(super::layout::RUNTIME_DIRECTORY)
+        .join(product)
+        .join(filename);
+    #[cfg(target_os = "macos")]
+    let expected =
+        Path::new(super::layout::RUNTIME_DIRECTORY).join(format!("{product}-{filename}"));
     if socket.path != expected {
         return Err(ProductValidationError::SocketPath {
             expected,
@@ -806,6 +924,7 @@ fn unsafe_unit_text(value: &str) -> bool {
         .any(|byte| byte.is_ascii_control() || byte == b'%')
 }
 
+#[cfg(target_os = "linux")]
 fn quote_systemd_path(path: &Path) -> String {
     quote_systemd_word(path.to_str().expect("validated systemd path is UTF-8"))
 }
@@ -820,6 +939,7 @@ fn validate_systemd_path(path: &Path) -> Result<(), ProductValidationError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn quote_systemd_word(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
@@ -834,6 +954,7 @@ fn quote_systemd_word(value: &str) -> String {
     quoted
 }
 
+#[cfg(target_os = "linux")]
 fn render_path_list(name: &str, paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         String::new()
@@ -850,10 +971,10 @@ fn render_path_list(name: &str, paths: &[PathBuf]) -> String {
 }
 
 fn system_unit_path(unit: &str) -> PathBuf {
-    Path::new("/etc/systemd/system").join(unit)
+    Path::new(super::layout::UNIT_DIRECTORY).join(unit)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

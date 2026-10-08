@@ -1,6 +1,7 @@
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -10,18 +11,18 @@ use std::process::{Command, Stdio};
 use super::JobId;
 use super::validation::is_valid_identifier;
 use anyhow::{Context, Result, anyhow, bail};
-use rustix::fs::{
-    AtFlags, Gid, Mode, OFlags, RawDir, Uid, chmodat, fchmod, fchown, mkdirat, openat,
-};
+use rustix::fs::{AtFlags, Gid, Mode, OFlags, Uid, chmodat, fchmod, fchown, mkdirat, openat};
 
 const BUILD_USER: &str = "capulus-build";
 const BUILD_GROUP: &str = "capulus-build";
+#[cfg(target_os = "linux")]
 const BUILD_HOME: &str = "/var/lib/capulus-build";
-const BUILD_CARGO_TOOLS_HOME: &str = "/var/lib/capulus-build/cargo-tools";
-const BUILD_RUSTUP_HOME: &str = "/var/lib/capulus-build/rustup";
-const BUILD_CACHE_HOME: &str = "/var/lib/capulus-build/cache";
-const BUILD_TARGET_HOME: &str = "/var/lib/capulus-build/target";
-const BUILD_JOBS_HOME: &str = "/var/lib/capulus-build/jobs";
+#[cfg(target_os = "macos")]
+const BUILD_HOME: &str = "/private/var/lib/capulus-build";
+#[cfg(target_os = "linux")]
+const BUILD_SHELL: &str = "/usr/sbin/nologin";
+#[cfg(target_os = "macos")]
+const BUILD_SHELL: &str = "/usr/bin/false";
 const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,7 +46,7 @@ impl UnixAccount {
 
     pub fn is_member_of(&self, group: &str) -> Result<bool> {
         let group_id =
-            group_gid(group)?.ok_or_else(|| anyhow!("NSS group {group:?} does not exist"))?;
+            unix_group_gid(group)?.ok_or_else(|| anyhow!("NSS group {group:?} does not exist"))?;
         if self.gid == group_id {
             return Ok(true);
         }
@@ -54,15 +55,26 @@ impl UnixAccount {
         let mut count = 0;
         // SAFETY: this first call requests the required group count and writes no group IDs.
         unsafe {
-            libc::getgrouplist(name.as_ptr(), self.gid, std::ptr::null_mut(), &mut count);
+            libc::getgrouplist(
+                name.as_ptr(),
+                self.gid as _,
+                std::ptr::null_mut(),
+                &mut count,
+            );
         }
         if count <= 0 {
             return Ok(false);
         }
         let mut groups = vec![0; count as usize];
         // SAFETY: `groups` has the capacity reported by the preceding call and `name` is NUL-terminated.
-        let result =
-            unsafe { libc::getgrouplist(name.as_ptr(), self.gid, groups.as_mut_ptr(), &mut count) };
+        let result = unsafe {
+            libc::getgrouplist(
+                name.as_ptr(),
+                self.gid as _,
+                groups.as_mut_ptr(),
+                &mut count,
+            )
+        };
         if result < 0 {
             bail!(
                 "NSS supplementary group list changed while resolving {}",
@@ -70,6 +82,9 @@ impl UnixAccount {
             );
         }
         groups.truncate(count as usize);
+        #[cfg(target_os = "macos")]
+        let group_id = i32::try_from(group_id)
+            .context("Directory Services group ID is outside the supported range")?;
         Ok(groups.contains(&group_id))
     }
 
@@ -88,6 +103,7 @@ impl UnixAccount {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn command(&self, program: impl AsRef<OsStr>) -> Command {
         let mut command = Command::new("/usr/bin/setpriv");
         command
@@ -110,6 +126,36 @@ impl UnixAccount {
         command
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn command(&self, program: impl AsRef<OsStr>) -> Command {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new(program);
+        command
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("USER", &self.name)
+            .env("LOGNAME", &self.name)
+            .env("SHELL", &self.shell)
+            .env("PATH", SYSTEM_PATH)
+            .env("LANG", "en_US.UTF-8")
+            .current_dir(&self.home)
+            .stdin(Stdio::null());
+        let (uid, gid) = (self.uid, self.gid);
+        // SAFETY: only async-signal-safe credential syscalls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(gid) != 0
+                    || libc::setuid(uid) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
+    }
+
     pub(super) fn create_file(&self, path: &Path, mode: u32) -> Result<File> {
         let file = OpenOptions::new()
             .read(true)
@@ -126,7 +172,7 @@ impl UnixAccount {
         )
         .map_err(std::io::Error::from)
         .with_context(|| format!("failed to set ownership on {}", path.display()))?;
-        fchmod(&file, Mode::from_raw_mode(mode))
+        fchmod(&file, Mode::from_raw_mode(mode as _))
             .map_err(std::io::Error::from)
             .with_context(|| format!("failed to set permissions on {}", path.display()))?;
         Ok(file)
@@ -211,28 +257,15 @@ impl DirectoryOwner {
 impl BuildAccount {
     pub(super) fn ensure() -> Result<Self> {
         require_root()?;
+        prepare_state_parent()?;
         if UnixAccount::by_name(BUILD_USER)?.is_none() {
-            ensure_build_group()?;
-            checked_command(
-                Command::new("/usr/sbin/useradd").args([
-                    "--system",
-                    "--gid",
-                    BUILD_GROUP,
-                    "--home-dir",
-                    BUILD_HOME,
-                    "--no-create-home",
-                    "--shell",
-                    "/usr/sbin/nologin",
-                    BUILD_USER,
-                ]),
-                "create shared Capulus build account",
-            )?;
+            create_build_account()?;
         }
         let account = UnixAccount::by_name(BUILD_USER)?
             .ok_or_else(|| anyhow!("shared Capulus build account was not created"))?;
         account.validate_build_account()?;
         if account.home != Path::new(BUILD_HOME)
-            || account.shell != Path::new("/usr/sbin/nologin")
+            || account.shell != Path::new(BUILD_SHELL)
             || group_name(account.gid)?.as_deref() != Some(BUILD_GROUP)
         {
             bail!(
@@ -241,11 +274,11 @@ impl BuildAccount {
         }
         let build = Self {
             account,
-            cargo_tools_home: PathBuf::from(BUILD_CARGO_TOOLS_HOME),
-            rustup_home: PathBuf::from(BUILD_RUSTUP_HOME),
-            cache_home: PathBuf::from(BUILD_CACHE_HOME),
-            target_home: PathBuf::from(BUILD_TARGET_HOME),
-            jobs_home: PathBuf::from(BUILD_JOBS_HOME),
+            cargo_tools_home: Path::new(BUILD_HOME).join("cargo-tools"),
+            rustup_home: Path::new(BUILD_HOME).join("rustup"),
+            cache_home: Path::new(BUILD_HOME).join("cache"),
+            target_home: Path::new(BUILD_HOME).join("target"),
+            jobs_home: Path::new(BUILD_HOME).join("jobs"),
         };
         build.ensure_layout_with(DirectoryOwner::ROOT)?;
         Ok(build)
@@ -568,8 +601,95 @@ pub(super) fn require_root() -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn create_build_account() -> Result<()> {
+    ensure_build_group()?;
+    checked_command(
+        Command::new("/usr/sbin/useradd").args([
+            "--system",
+            "--gid",
+            BUILD_GROUP,
+            "--home-dir",
+            BUILD_HOME,
+            "--no-create-home",
+            "--shell",
+            BUILD_SHELL,
+            BUILD_USER,
+        ]),
+        "create shared Capulus build account",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn create_build_account() -> Result<()> {
+    let gid = match unix_group_gid(BUILD_GROUP)? {
+        Some(gid) => gid,
+        None => {
+            let gid = unused_directory_id("/Groups", "PrimaryGroupID")?;
+            dscl_create(
+                &format!("/Groups/{BUILD_GROUP}"),
+                &[
+                    ("PrimaryGroupID", gid.to_string()),
+                    ("Password", "*".into()),
+                ],
+            )?;
+            gid
+        }
+    };
+    anyhow::ensure!(
+        gid > 0 && gid < 500,
+        "Capulus build group is not a system group"
+    );
+    let uid = unused_directory_id("/Users", "UniqueID")?;
+    dscl_create(&format!("/Users/{BUILD_USER}"), &[
+        ("UserShell", BUILD_SHELL.into()), ("Password", "*".into()), ("IsHidden", "1".into()),
+        ("NFSHomeDirectory", BUILD_HOME.into()), ("PrimaryGroupID", gid.to_string()),
+        ("UniqueID", uid.to_string()),
+    ]).context("build-account creation failed; inspect and repair the retained Directory Services record before retrying")
+}
+
+#[cfg(target_os = "macos")]
+fn unused_directory_id(records: &str, key: &str) -> Result<u32> {
+    let output = crate::process::CaptureOptions::default().validate()?.run(
+        Command::new("/usr/bin/dscl").args([".", "-list", records, key]),
+        None,
+    )?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot list Directory Services IDs: {}",
+        output.stderr.trim()
+    );
+    let ids = output
+        .stdout
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .last()
+                .ok_or_else(|| anyhow!("empty Directory Services record"))?
+                .parse::<u32>()
+                .context("invalid Directory Services ID")
+        })
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    (300..500)
+        .rev()
+        .find(|id| !ids.contains(id))
+        .ok_or_else(|| anyhow!("no unused system account ID"))
+}
+
+#[cfg(target_os = "macos")]
+fn dscl_create(record: &str, values: &[(&str, String)]) -> Result<()> {
+    for (key, value) in values {
+        checked_command(
+            Command::new("/usr/bin/dscl").args([".", "-create", record, key, value]),
+            "create Capulus Directory Services record",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn ensure_build_group() -> Result<()> {
-    if group_gid(BUILD_GROUP)?.is_some() {
+    if unix_group_gid(BUILD_GROUP)?.is_some() {
         return Ok(());
     }
     checked_command(
@@ -607,10 +727,27 @@ pub(super) fn ensure_owned_directory(path: &Path, account: &UnixAccount, mode: u
     )
     .map_err(std::io::Error::from)
     .with_context(|| format!("failed to chown {}", path.display()))?;
-    fchmod(&directory, Mode::from_raw_mode(mode))
+    fchmod(&directory, Mode::from_raw_mode(mode as _))
         .map_err(std::io::Error::from)
         .with_context(|| format!("failed to chmod {}", path.display()))?;
     directory.sync_all().map_err(Into::into)
+}
+
+pub(super) fn prepare_state_parent() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = Path::new("/private/var/lib");
+        if !path.try_exists()? {
+            ensure_root_directory(path, 0o755)?;
+        }
+        let directory = open_real_directory(path)?;
+        let metadata = directory.metadata()?;
+        anyhow::ensure!(
+            metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+            "managed state parent must be root-owned and not writable by other users"
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_root_directory(path: &Path, mode: u32) -> Result<()> {
@@ -623,7 +760,7 @@ pub(super) fn ensure_root_directory(path: &Path, mode: u32) -> Result<()> {
             path.display()
         );
     }
-    fchmod(&directory, Mode::from_raw_mode(mode)).map_err(std::io::Error::from)?;
+    fchmod(&directory, Mode::from_raw_mode(mode as _)).map_err(std::io::Error::from)?;
     directory.sync_all()?;
     if initializing {
         open_real_directory(path.parent().expect("managed directories have a parent"))?
@@ -691,9 +828,10 @@ pub(super) fn open_directory_at(parent: &File, name: &OsStr) -> Result<File> {
     .map_err(|error| std::io::Error::from(error).into())
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn require_empty_directory(directory: &File, path: &Path) -> Result<()> {
     let mut buffer = [MaybeUninit::uninit(); 4096];
-    let mut entries = RawDir::new(directory, &mut buffer);
+    let mut entries = rustix::fs::RawDir::new(directory, &mut buffer);
     while let Some(entry) = entries.next() {
         let entry = entry.map_err(std::io::Error::from)?;
         if !matches!(entry.file_name().to_bytes(), b"." | b"..") {
@@ -704,6 +842,49 @@ pub(super) fn require_empty_directory(directory: &File, path: &Path) -> Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn require_empty_directory(directory: &File, path: &Path) -> Result<()> {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    let descriptor = rustix::io::dup(directory).map_err(std::io::Error::from)?;
+    // SAFETY: fdopendir takes ownership only on success; the RAII wrapper closes the DIR.
+    let stream = unsafe { libc::fdopendir(descriptor.as_raw_fd()) };
+    anyhow::ensure!(
+        !stream.is_null(),
+        "open directory stream: {}",
+        std::io::Error::last_os_error()
+    );
+    let _ = descriptor.into_raw_fd();
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    let stream = Directory(stream);
+    loop {
+        // SAFETY: errno belongs to this thread and readdir's pointer lives until the next call.
+        let entry = unsafe {
+            *libc::__error() = 0;
+            libc::readdir(stream.0)
+        };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(0) {
+                return Err(error.into());
+            }
+            return Ok(());
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        anyhow::ensure!(
+            matches!(name.to_bytes(), b"." | b".."),
+            "interrupted Capulus directory creation is not empty: {}",
+            path.display()
+        );
+    }
 }
 
 pub(super) fn open_real_directory(path: &Path) -> Result<File> {
@@ -734,24 +915,25 @@ pub(super) fn set_directory_mode_and_sync(
     mode: u32,
     context: &str,
 ) -> Result<()> {
-    fchmod(directory, Mode::from_raw_mode(mode))
+    fchmod(directory, Mode::from_raw_mode(mode as _))
         .map_err(std::io::Error::from)
         .with_context(|| context.to_owned())?;
     directory.sync_all().map_err(Into::into)
 }
 
 fn checked_command(command: &mut Command, action: &str) -> Result<()> {
-    let output = command
-        .output()
+    let output = crate::process::CaptureOptions::default()
+        .validate()?
+        .run(command, None)
         .with_context(|| format!("failed to {action}"))?;
     if output.status.success() {
         return Ok(());
     }
-    let detail = String::from_utf8_lossy(if output.stderr.is_empty() {
+    let detail = if output.stderr.is_empty() {
         &output.stdout
     } else {
         &output.stderr
-    });
+    };
     bail!("failed to {action}: {}", detail.trim())
 }
 
@@ -799,7 +981,7 @@ fn lookup_passwd(uid: u32, name: Option<&CStr>) -> Result<Option<UnixAccount>> {
     }))
 }
 
-fn group_gid(name: &str) -> Result<Option<u32>> {
+pub fn unix_group_gid(name: &str) -> Result<Option<u32>> {
     let name = CString::new(name).context("NSS group name contains a NUL byte")?;
     lookup_group(Some(&name), 0).map(|group| group.map(|(gid, _)| gid))
 }
@@ -871,6 +1053,15 @@ fn passwd_buffer_len() -> usize {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn login_id_min(name: &str) -> Result<u32> {
+    match name {
+        "UID_MIN" | "GID_MIN" => Ok(500),
+        _ => bail!("unknown account boundary {name}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn login_id_min(name: &str) -> Result<u32> {
     let contents =
         fs::read_to_string("/etc/login.defs").context("failed to read /etc/login.defs")?;
@@ -921,13 +1112,14 @@ mod tests {
                 .is_none()
         );
         assert!(
-            group_gid("capulus-test-group-does-not-exist")
+            unix_group_gid("capulus-test-group-does-not-exist")
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn account_command_uses_one_exact_setpriv_boundary() {
         let account = UnixAccount::by_uid(rustix::process::getuid().as_raw()).unwrap();
         let command = account.command("/bin/true");

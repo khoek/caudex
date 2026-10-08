@@ -6,7 +6,7 @@ mod termination;
 pub mod artifact_store;
 pub mod containers;
 pub mod gcp;
-#[cfg(all(target_os = "linux", feature = "managed-client"))]
+#[cfg(all(unix, feature = "managed-client"))]
 pub mod managed;
 pub mod paths;
 pub mod process;

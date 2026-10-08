@@ -1,12 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(any(target_os = "linux", test))]
+use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::env;
-use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::FromRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{BorrowedFd, RawFd};
 use std::os::unix::net::UnixListener;
 
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::net::{SocketType, sockopt::socket_type};
 
+#[cfg(target_os = "linux")]
 const SYSTEMD_LISTEN_FD_START: RawFd = 3;
+#[cfg(target_os = "linux")]
 const MAX_ACTIVATED_LISTENERS: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,15 +28,15 @@ pub enum ActivationError {
     TooManyListeners(usize),
     #[error("systemd socket descriptor names do not match LISTEN_FDS")]
     NameCountMismatch,
-    #[error("systemd passed duplicate socket descriptor name {0:?}")]
+    #[error("service manager passed duplicate socket descriptor name {0:?}")]
     DuplicateName(String),
-    #[error("systemd did not pass required socket descriptor {0:?}")]
+    #[error("service manager did not pass required socket descriptor {0:?}")]
     MissingName(String),
     #[error("systemd passed unexpected socket descriptor {0:?}")]
     UnexpectedName(String),
-    #[error("systemd descriptor {name:?} is not a Unix stream listener")]
+    #[error("activated descriptor {name:?} is not a Unix stream listener")]
     WrongSocketType { name: String },
-    #[error("failed to adopt systemd descriptor {name:?}: {source}")]
+    #[error("failed to adopt activated descriptor {name:?}: {source}")]
     Adopt {
         name: String,
         #[source]
@@ -43,7 +50,8 @@ pub struct ActivatedListeners {
 }
 
 impl ActivatedListeners {
-    /// Adopts systemd's named descriptors. Call this once during single-threaded process startup.
+    /// Adopts named service-manager descriptors once during single-threaded process startup.
+    #[cfg(target_os = "linux")]
     pub fn from_environment(required_names: &[&str]) -> Result<Self, ActivationError> {
         let listen_pid = required_env("LISTEN_PID")?;
         let actual = parse_u32("LISTEN_PID", &listen_pid)?;
@@ -89,6 +97,75 @@ impl ActivatedListeners {
         Ok(Self { listeners })
     }
 
+    /// Adopts launchd's named descriptors once during single-threaded process startup.
+    #[cfg(target_os = "macos")]
+    pub fn from_environment(required_names: &[&str]) -> Result<Self, ActivationError> {
+        use std::ffi::CString;
+        use std::os::fd::OwnedFd;
+        unsafe extern "C" {
+            fn launch_activate_socket(
+                name: *const libc::c_char,
+                descriptors: *mut *mut libc::c_int,
+                count: *mut libc::size_t,
+            ) -> libc::c_int;
+        }
+        let mut listeners = BTreeMap::new();
+        for &name in required_names {
+            if listeners.contains_key(name) {
+                return Err(ActivationError::DuplicateName(name.into()));
+            }
+            let c_name =
+                CString::new(name).map_err(|_| ActivationError::MissingName(name.into()))?;
+            let mut descriptors = std::ptr::null_mut();
+            let mut count = 0;
+            // SAFETY: launchd allocates an array of owned descriptors; we free the array and adopt every fd.
+            let status =
+                unsafe { launch_activate_socket(c_name.as_ptr(), &mut descriptors, &mut count) };
+            if status != 0 {
+                return Err(ActivationError::Adopt {
+                    name: name.into(),
+                    source: std::io::Error::from_raw_os_error(status),
+                });
+            }
+            if descriptors.is_null() {
+                return Err(ActivationError::MissingName(name.into()));
+            }
+            let mut owned = unsafe { std::slice::from_raw_parts(descriptors, count) }
+                .iter()
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(*fd) })
+                .collect::<Vec<_>>();
+            unsafe {
+                libc::free(descriptors.cast());
+            }
+            if owned.len() != 1 {
+                return Err(ActivationError::WrongSocketType { name: name.into() });
+            }
+            let descriptor = owned.pop().expect("one activated listener");
+            if socket_type(&descriptor).map_err(|source| ActivationError::Adopt {
+                name: name.into(),
+                source: source.into(),
+            })? != SocketType::STREAM
+            {
+                return Err(ActivationError::WrongSocketType { name: name.into() });
+            }
+            fcntl_setfd(&descriptor, FdFlags::CLOEXEC).map_err(|source| {
+                ActivationError::Adopt {
+                    name: name.into(),
+                    source: source.into(),
+                }
+            })?;
+            let listener = UnixListener::from(descriptor);
+            listener
+                .local_addr()
+                .map_err(|source| ActivationError::Adopt {
+                    name: name.into(),
+                    source,
+                })?;
+            listeners.insert(name.into(), listener);
+        }
+        Ok(Self { listeners })
+    }
+
     pub fn take(&mut self, name: &str) -> Result<UnixListener, ActivationError> {
         self.listeners
             .remove(name)
@@ -114,10 +191,12 @@ impl ActivatedListeners {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn required_env(name: &'static str) -> Result<String, ActivationError> {
     env::var(name).map_err(|_| ActivationError::MissingEnvironment(name))
 }
 
+#[cfg(target_os = "linux")]
 fn parse_u32(name: &'static str, value: &str) -> Result<u32, ActivationError> {
     value
         .parse()
@@ -127,6 +206,7 @@ fn parse_u32(name: &'static str, value: &str) -> Result<u32, ActivationError> {
         })
 }
 
+#[cfg(target_os = "linux")]
 fn parse_usize(name: &'static str, value: &str) -> Result<usize, ActivationError> {
     value
         .parse()
@@ -136,6 +216,7 @@ fn parse_usize(name: &'static str, value: &str) -> Result<usize, ActivationError
         })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_names(
     count: usize,
     value: &str,
@@ -172,6 +253,7 @@ fn parse_names(
     Ok(names)
 }
 
+#[cfg(target_os = "linux")]
 fn clear_activation_environment() {
     // SAFETY: from_environment is documented and used only during single-threaded process startup,
     // before any product worker or Tokio task can concurrently inspect or modify the environment.

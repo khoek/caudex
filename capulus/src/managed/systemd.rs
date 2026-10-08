@@ -8,9 +8,9 @@ use zbus::zvariant::Value;
 use super::{JobId, ManagedProduct};
 
 #[derive(Clone, Debug)]
-pub(super) struct SystemdManager;
+pub(super) struct ServiceManager;
 
-impl SystemdManager {
+impl ServiceManager {
     pub fn redeploy_unit_name(product: &ManagedProduct, job: JobId) -> String {
         format!("{}-redeploy-{job}.service", product.name())
     }
@@ -19,7 +19,7 @@ impl SystemdManager {
         &self,
         product: &ManagedProduct,
         job: JobId,
-    ) -> Result<String, SystemdError> {
+    ) -> Result<String, ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -74,7 +74,7 @@ impl SystemdManager {
         manager
             .start_transient_unit(&unit, Mode::Fail, &properties, &[])
             .await
-            .map_err(|source| SystemdError::Start {
+            .map_err(|source| ServiceError::Start {
                 unit: unit.clone(),
                 source: Box::new(source),
             })?;
@@ -85,7 +85,7 @@ impl SystemdManager {
         &self,
         product: &ManagedProduct,
         job: JobId,
-    ) -> Result<bool, SystemdError> {
+    ) -> Result<bool, ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -120,7 +120,7 @@ impl SystemdManager {
     pub(super) async fn enabled_units(
         &self,
         product: &ManagedProduct,
-    ) -> Result<Vec<String>, SystemdError> {
+    ) -> Result<Vec<String>, ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -137,7 +137,7 @@ impl SystemdManager {
                 Ok(_) => {}
                 Err(error) if missing_unit_file(&error) => {}
                 Err(source) => {
-                    return Err(SystemdError::Operation {
+                    return Err(ServiceError::Operation {
                         action: format!("inspect unit-file state for {unit}"),
                         source: Box::new(source),
                     });
@@ -153,7 +153,7 @@ impl SystemdManager {
         target_enable_units: &[String],
         previously_enabled: &[String],
         previous_service_file: bool,
-    ) -> Result<(), SystemdError> {
+    ) -> Result<(), ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -201,7 +201,7 @@ impl SystemdManager {
     pub(super) async fn refresh_installation(
         &self,
         product: &ManagedProduct,
-    ) -> Result<(), SystemdError> {
+    ) -> Result<(), ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -229,7 +229,7 @@ impl SystemdManager {
         target_enable_units: &[String],
         previously_enabled: &[String],
         previous_service_file: bool,
-    ) -> Result<(), SystemdError> {
+    ) -> Result<(), ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -270,7 +270,7 @@ impl SystemdManager {
     pub(super) async fn deactivate_installation(
         &self,
         product: &ManagedProduct,
-    ) -> Result<(), SystemdError> {
+    ) -> Result<(), ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         let manager = ManagerProxy::new(&connection)
             .await
@@ -289,7 +289,7 @@ impl SystemdManager {
             .map_err(|source| operation("reload systemd after deactivation", source))
     }
 
-    pub(super) async fn reload_removed_installation(&self) -> Result<(), SystemdError> {
+    pub(super) async fn reload_removed_installation(&self) -> Result<(), ServiceError> {
         let connection = zbus::Connection::system().await.map_err(connect_error)?;
         ManagerProxy::new(&connection)
             .await
@@ -326,7 +326,7 @@ async fn activate_sockets(
     manager: &ManagerProxy<'_>,
     units: &[String],
     activation: SocketActivation,
-) -> Result<(), SystemdError> {
+) -> Result<(), ServiceError> {
     for socket in units.iter().filter(|unit| unit.ends_with(".socket")) {
         let result = match activation {
             SocketActivation::Start => manager.start_unit(socket, Mode::Replace).await,
@@ -352,7 +352,7 @@ async fn stop_product_runtime(
     connection: &zbus::Connection,
     manager: &ManagerProxy<'_>,
     product: &ManagedProduct,
-) -> Result<(), SystemdError> {
+) -> Result<(), ServiceError> {
     for unit in [
         product.application_socket_name(),
         product.management_socket_name(),
@@ -368,7 +368,7 @@ async fn stop_obsolete_units(
     manager: &ManagerProxy<'_>,
     previous: &[String],
     target: &[String],
-) -> Result<(), SystemdError> {
+) -> Result<(), ServiceError> {
     for unit in previous.iter().filter(|unit| !target.contains(unit)) {
         stop_unit_if_present(connection, manager, unit).await?;
     }
@@ -379,7 +379,7 @@ async fn restore_unit_enablement(
     manager: &ManagerProxy<'_>,
     target: &[String],
     previous: &[String],
-) -> Result<(), SystemdError> {
+) -> Result<(), ServiceError> {
     let disable = previous
         .iter()
         .filter(|unit| !target.contains(unit))
@@ -404,11 +404,11 @@ async fn restore_unit_enablement(
     Ok(())
 }
 
-fn remove_application_socket(product: &ManagedProduct) -> Result<(), SystemdError> {
+fn remove_application_socket(product: &ManagedProduct) -> Result<(), ServiceError> {
     let path = product.application_socket_path();
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == 0 => {
-            fs::remove_file(path).map_err(|source| SystemdError::SocketRemoval {
+            fs::remove_file(path).map_err(|source| ServiceError::SocketRemoval {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -417,14 +417,14 @@ fn remove_application_socket(product: &ManagedProduct) -> Result<(), SystemdErro
                     .expect("validated application socket has a parent"),
             )
             .and_then(|directory| directory.sync_all())
-            .map_err(|source| SystemdError::SocketRemoval {
+            .map_err(|source| ServiceError::SocketRemoval {
                 path: path.to_path_buf(),
                 source,
             })
         }
-        Ok(_) => Err(SystemdError::UnsafeApplicationSocket(path.to_path_buf())),
+        Ok(_) => Err(ServiceError::UnsafeApplicationSocket(path.to_path_buf())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(SystemdError::SocketRemoval {
+        Err(source) => Err(ServiceError::SocketRemoval {
             path: path.to_path_buf(),
             source,
         }),
@@ -435,7 +435,7 @@ async fn stop_unit_if_present(
     connection: &zbus::Connection,
     manager: &ManagerProxy<'_>,
     unit: &str,
-) -> Result<(), SystemdError> {
+) -> Result<(), ServiceError> {
     match manager.stop_unit(unit, Mode::Replace).await {
         Ok(_) => wait_until_inactive(connection, manager, unit).await,
         Err(error) if missing_unit_file(&error) => Ok(()),
@@ -447,7 +447,7 @@ async fn wait_until_inactive(
     connection: &zbus::Connection,
     manager: &ManagerProxy<'_>,
     unit: &str,
-) -> Result<(), SystemdError> {
+) -> Result<(), ServiceError> {
     let path = match manager.get_unit(unit).await {
         Ok(path) => path,
         Err(error) if missing_unit_file(&error) => return Ok(()),
@@ -467,7 +467,7 @@ async fn wait_until_inactive(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Ok(_) => {
-                return Err(SystemdError::UnitStopTimeout(unit.to_string()));
+                return Err(ServiceError::UnitStopTimeout(unit.to_string()));
             }
             Err(error) if missing_unit_file(&error) => return Ok(()),
             Err(source) => {
@@ -477,15 +477,15 @@ async fn wait_until_inactive(
     }
 }
 
-fn operation(action: impl Into<String>, source: zbus::Error) -> SystemdError {
-    SystemdError::Operation {
+fn operation(action: impl Into<String>, source: zbus::Error) -> ServiceError {
+    ServiceError::Operation {
         action: action.into(),
         source: Box::new(source),
     }
 }
 
-fn connect_error(source: zbus::Error) -> SystemdError {
-    SystemdError::Connect(Box::new(source))
+fn connect_error(source: zbus::Error) -> ServiceError {
+    ServiceError::Connect(Box::new(source))
 }
 
 fn missing_unit_file(error: &zbus::Error) -> bool {
@@ -501,12 +501,12 @@ fn missing_unit_error_name(name: &str) -> bool {
     )
 }
 
-fn duration_microseconds(duration: Duration) -> Result<u64, SystemdError> {
-    u64::try_from(duration.as_micros()).map_err(|_| SystemdError::DurationOverflow)
+fn duration_microseconds(duration: Duration) -> Result<u64, ServiceError> {
+    u64::try_from(duration.as_micros()).map_err(|_| ServiceError::DurationOverflow)
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SystemdError {
+pub enum ServiceError {
     #[error("failed to connect to the systemd system bus: {0}")]
     Connect(Box<zbus::Error>),
     #[error("failed to start transient unit {unit}: {source}")]
@@ -591,7 +591,7 @@ mod tests {
     fn transient_unit_name_has_only_fixed_product_and_hex_job() {
         let job = JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
         assert_eq!(
-            SystemdManager::redeploy_unit_name(&product(), job),
+            ServiceManager::redeploy_unit_name(&product(), job),
             "auc-redeploy-deadbeefdeadbeefdeadbeefdeadbeef.service"
         );
     }

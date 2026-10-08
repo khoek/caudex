@@ -13,10 +13,10 @@ use sha2::{Digest, Sha256};
 use super::account::{ensure_root_directory, require_root};
 use super::build::ArtifactOwner;
 use super::build::run_with_deadline;
-use super::{BuildArtifacts, JobId, ManagedFile, ManagedProduct, RepairOutcome, SystemdManager};
+use super::{BuildArtifacts, JobId, ManagedFile, ManagedProduct, RepairOutcome, ServiceManager};
 
-const INSTALLATION_STATE_ROOT: &str = "/var/lib/capulus/installations";
-const INSTALLATION_LOCK_ROOT: &str = "/run/capulus/locks";
+const INSTALLATION_STATE_ROOT: &str = super::layout::INSTALLATION_STATE;
+const INSTALLATION_LOCK_ROOT: &str = super::layout::LOCK_DIRECTORY;
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SystemInstallation {
@@ -85,7 +85,7 @@ impl SystemInstallation {
                 }
             }
         }
-        SystemdManager.refresh_installation(product).await?;
+        ServiceManager.refresh_installation(product).await?;
         Ok(RepairOutcome {
             changed,
             detail: if changed {
@@ -110,7 +110,7 @@ impl SystemInstallation {
         }
         recover_uninstallation(product).await?;
         artifacts.validate(product)?;
-        let previously_enabled = SystemdManager.enabled_units(product).await?;
+        let previously_enabled = ServiceManager.enabled_units(product).await?;
         let target_files = artifacts
             .manifest
             .files
@@ -141,29 +141,24 @@ impl SystemInstallation {
             records.push(plan_record(product, job, artifacts, destination, None)?);
         }
         let previous_service_file = records.iter().any(|record| {
-            record.destination == Path::new("/etc/systemd/system").join(product.service_name())
-                && record.original_digest.is_some()
-        });
-        let previous_application_socket_file = records.iter().any(|record| {
             record.destination
-                == Path::new("/etc/systemd/system").join(product.application_socket_name())
+                == Path::new(super::layout::UNIT_DIRECTORY).join(product.service_name())
                 && record.original_digest.is_some()
         });
-        let previous_management_socket_file = records.iter().any(|record| {
-            record.destination
-                == Path::new("/etc/systemd/system").join(product.management_socket_name())
-                && record.original_digest.is_some()
-        });
-        let previous_units = [
-            previous_service_file,
-            previous_application_socket_file,
-            previous_management_socket_file,
-        ];
+        let previous_units = super::layout::installation_units(product.name())
+            .iter()
+            .map(|unit| {
+                records.iter().any(|record| {
+                    record.destination == Path::new(super::layout::UNIT_DIRECTORY).join(unit)
+                        && record.original_digest.is_some()
+                })
+            })
+            .collect::<Vec<_>>();
         if previous_units.iter().any(|exists| *exists)
             && !previous_units.iter().all(|exists| *exists)
         {
             bail!(
-                "existing {} installation does not have the required service-and-two-socket topology; repair it explicitly before redeploying",
+                "existing {} installation does not have the declared native service topology; repair it explicitly before redeploying",
                 product.name()
             );
         }
@@ -236,7 +231,7 @@ impl SystemInstallation {
         if !self.files_committed {
             bail!("cannot activate an uncommitted Capulus installation");
         }
-        SystemdManager
+        ServiceManager
             .activate_installation(
                 &self.product,
                 &self.journal.target_enable_units,
@@ -252,7 +247,7 @@ impl SystemInstallation {
             bail!("cannot roll back an accepted Capulus installation");
         }
         let filesystem_result = rollback_files(&self.journal);
-        let systemd_result = SystemdManager
+        let service_result = ServiceManager
             .restore_installation(
                 &self.product,
                 &self.journal.target_enable_units,
@@ -260,16 +255,16 @@ impl SystemInstallation {
                 self.journal.previous_service_file,
             )
             .await;
-        match (filesystem_result, systemd_result) {
+        match (filesystem_result, service_result) {
             (Ok(()), Ok(())) => {
                 self.files_committed = false;
                 self.cleanup_staging()?;
                 remove_private_file(&self.journal_path)
             }
             (Err(filesystem), Ok(())) => Err(filesystem),
-            (Ok(()), Err(systemd)) => Err(systemd.into()),
-            (Err(filesystem), Err(systemd)) => Err(anyhow!(
-                "filesystem rollback failed: {filesystem:#}; systemd restoration failed: {systemd}"
+            (Ok(()), Err(service)) => Err(service.into()),
+            (Err(filesystem), Err(service)) => Err(anyhow!(
+                "filesystem rollback failed: {filesystem:#}; service restoration failed: {service}"
             )),
         }
     }
@@ -299,10 +294,10 @@ impl SystemInstallation {
         journal.validate(product.name())?;
         if journal.accepted {
             validate_committed_files(&journal)?;
-            SystemdManager.refresh_installation(product).await?;
+            ServiceManager.refresh_installation(product).await?;
         } else {
             rollback_files(&journal)?;
-            SystemdManager
+            ServiceManager
                 .restore_installation(
                     product,
                     &journal.target_enable_units,
@@ -317,7 +312,10 @@ impl SystemInstallation {
 
     fn verify_committed_units(&self) -> Result<()> {
         let units = committed_unit_paths(&self.journal);
+        #[cfg(target_os = "linux")]
         let mut command = Command::new("/usr/bin/systemd-analyze");
+        #[cfg(target_os = "macos")]
+        let mut command = Command::new("/usr/bin/plutil");
         command
             .env_clear()
             .env(
@@ -325,7 +323,11 @@ impl SystemInstallation {
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             )
             .env("LANG", "C.UTF-8")
-            .arg("verify")
+            .arg(if cfg!(target_os = "macos") {
+                "-lint"
+            } else {
+                "verify"
+            })
             .args(&units)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -333,7 +335,7 @@ impl SystemInstallation {
         run_with_deadline(
             &mut command,
             VERIFY_TIMEOUT,
-            "verify committed systemd units",
+            "verify committed service files",
         )?;
         Ok(())
     }
@@ -347,7 +349,9 @@ fn committed_unit_paths(journal: &InstallationJournal) -> Vec<&Path> {
     journal
         .records
         .iter()
-        .filter(|record| record.destination.parent() == Some(Path::new("/etc/systemd/system")))
+        .filter(|record| {
+            record.destination.parent() == Some(Path::new(super::layout::UNIT_DIRECTORY))
+        })
         .filter(|record| record.new_digest.is_some())
         .map(|record| record.destination.as_path())
         .collect()
@@ -381,7 +385,7 @@ impl SystemUninstallation {
         let journal = UninstallationJournal {
             product: product.name().to_string(),
             job,
-            previously_enabled: SystemdManager.enabled_units(product).await?,
+            previously_enabled: ServiceManager.enabled_units(product).await?,
             committed_records: 0,
             removal_committed: false,
             records,
@@ -398,7 +402,7 @@ impl SystemUninstallation {
     }
 
     pub async fn deactivate(&mut self) -> Result<()> {
-        SystemdManager
+        ServiceManager
             .deactivate_installation(&self.product)
             .await?;
         self.deactivated = true;
@@ -407,7 +411,7 @@ impl SystemUninstallation {
 
     pub fn remove_files(&mut self) -> Result<()> {
         if !self.deactivated {
-            bail!("cannot remove managed files before deactivating their systemd units");
+            bail!("cannot remove managed files before deactivating their services");
         }
         for index in 0..self.journal.records.len() {
             let record = &self.journal.records[index];
@@ -461,7 +465,7 @@ impl SystemUninstallation {
         if self.journal.committed_records != self.journal.records.len() {
             bail!("cannot finalize an incomplete managed uninstall");
         }
-        SystemdManager.reload_removed_installation().await?;
+        ServiceManager.reload_removed_installation().await?;
         self.journal.removal_committed = true;
         write_uninstallation_journal(&self.journal_path, &self.journal)?;
         cleanup_uninstallation_staging(&self.journal)?;
@@ -474,7 +478,7 @@ impl SystemUninstallation {
 
     pub async fn rollback(&mut self) -> Result<()> {
         let filesystem = restore_uninstallation_files(&self.journal);
-        let systemd = SystemdManager
+        let service = ServiceManager
             .restore_installation(
                 &self.product,
                 &self.product.installation_manifest().enable_units,
@@ -482,15 +486,15 @@ impl SystemUninstallation {
                 true,
             )
             .await;
-        match (filesystem, systemd) {
+        match (filesystem, service) {
             (Ok(()), Ok(())) => {
                 cleanup_uninstallation_staging(&self.journal)?;
                 remove_private_file(&self.journal_path)
             }
             (Err(filesystem), Ok(())) => Err(filesystem),
-            (Ok(()), Err(systemd)) => Err(systemd.into()),
-            (Err(filesystem), Err(systemd)) => Err(anyhow!(
-                "uninstall filesystem rollback failed: {filesystem:#}; systemd restoration failed: {systemd}"
+            (Ok(()), Err(service)) => Err(service.into()),
+            (Err(filesystem), Err(service)) => Err(anyhow!(
+                "uninstall filesystem rollback failed: {filesystem:#}; service restoration failed: {service}"
             )),
         }
     }
@@ -589,25 +593,26 @@ impl InstallationJournal {
         let mut destinations = BTreeSet::new();
         for record in &self.records {
             validate_normal_absolute(&record.destination)?;
-            let valid_destination =
-                if record.destination.parent() == Some(Path::new("/usr/local/bin")) {
-                    record
-                        .destination
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name == product || name.starts_with(&allowed_units))
-                } else if record.destination.parent() == Some(Path::new("/etc/systemd/system")) {
-                    record
-                        .destination
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with(&allowed_units)
-                                && (name.ends_with(".service") || name.ends_with(".socket"))
-                        })
-                } else {
-                    false
-                };
+            let valid_destination = if record.destination.parent()
+                == Some(Path::new(super::layout::PROGRAM_DIRECTORY))
+            {
+                record
+                    .destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == product || name.starts_with(&allowed_units))
+            } else if record.destination.parent() == Some(Path::new(super::layout::UNIT_DIRECTORY))
+            {
+                record
+                    .destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&allowed_units) && super::layout::valid_unit_name(name)
+                    })
+            } else {
+                false
+            };
             let parent = record
                 .destination
                 .parent()
@@ -637,15 +642,13 @@ impl InstallationJournal {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let expected_target_units = BTreeSet::from([
-            format!("{product}-agent.service"),
-            format!("{product}-agent.socket"),
-            format!("{product}-capulus.socket"),
-        ]);
+        let expected_target_units = super::layout::installation_units(product)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         if target_units != expected_target_units
             || target_units.iter().any(|unit| {
                 !self.records.iter().any(|record| {
-                    record.destination == Path::new("/etc/systemd/system").join(unit)
+                    record.destination == Path::new(super::layout::UNIT_DIRECTORY).join(unit)
                         && record.new_digest.is_some()
                 })
             })
@@ -653,16 +656,15 @@ impl InstallationJournal {
             bail!("interrupted Capulus installation journal has unsafe target units");
         }
         let previous_file_exists = |unit: &str| {
-            let path = Path::new("/etc/systemd/system").join(unit);
+            let path = Path::new(super::layout::UNIT_DIRECTORY).join(unit);
             self.records
                 .iter()
                 .any(|record| record.destination == path && record.original_digest.is_some())
         };
-        let previous_units = [
-            previous_file_exists(&format!("{product}-agent.service")),
-            previous_file_exists(&format!("{product}-agent.socket")),
-            previous_file_exists(&format!("{product}-capulus.socket")),
-        ];
+        let previous_units = super::layout::installation_units(product)
+            .iter()
+            .map(|unit| previous_file_exists(unit))
+            .collect::<Vec<_>>();
         if self.previous_service_file != previous_units[0]
             || (previous_units.iter().any(|exists| *exists)
                 && !previous_units.iter().all(|exists| *exists))
@@ -1040,10 +1042,10 @@ async fn recover_uninstallation(product: &ManagedProduct) -> Result<()> {
                 );
             }
         }
-        SystemdManager.reload_removed_installation().await?;
+        ServiceManager.reload_removed_installation().await?;
     } else {
         restore_uninstallation_files(&journal)?;
-        SystemdManager
+        ServiceManager
             .restore_installation(
                 product,
                 &product.installation_manifest().enable_units,
@@ -1258,7 +1260,7 @@ fn managed_destination(managed: &ManagedFile) -> &Path {
 }
 
 fn acquire_installation_lock(product: &ManagedProduct) -> Result<crate::InvocationLock> {
-    ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
+    ensure_root_directory(Path::new(super::layout::CAPULUS_RUNTIME), 0o711)?;
     ensure_root_directory(Path::new(INSTALLATION_LOCK_ROOT), 0o700)?;
     crate::acquire_named_in(
         INSTALLATION_LOCK_ROOT,
@@ -1269,7 +1271,8 @@ fn acquire_installation_lock(product: &ManagedProduct) -> Result<crate::Invocati
 }
 
 fn ensure_installation_state_directory(product: &ManagedProduct) -> Result<PathBuf> {
-    ensure_root_directory(Path::new("/var/lib/capulus"), 0o700)?;
+    super::account::prepare_state_parent()?;
+    ensure_root_directory(Path::new(super::layout::STATE_DIRECTORY), 0o700)?;
     ensure_root_directory(Path::new(INSTALLATION_STATE_ROOT), 0o700)?;
     let state_directory = Path::new(INSTALLATION_STATE_ROOT).join(product.name());
     ensure_root_directory(&state_directory, 0o700)?;
@@ -1293,60 +1296,38 @@ mod tests {
 
     fn first_install_journal() -> InstallationJournal {
         let job = JobId::parse("deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+        let mut destinations = vec![Path::new(super::super::layout::PROGRAM_DIRECTORY).join("auc")];
+        let units = super::super::layout::installation_units("auc");
+        destinations.extend(
+            units
+                .iter()
+                .map(|name| Path::new(super::super::layout::UNIT_DIRECTORY).join(name)),
+        );
         InstallationJournal {
-            product: "auc".to_string(),
+            product: "auc".into(),
             job,
             previously_enabled: Vec::new(),
-            target_enable_units: vec![
-                "auc-agent.socket".to_string(),
-                "auc-capulus.socket".to_string(),
-                "auc-agent.service".to_string(),
-            ],
+            target_enable_units: units,
             previous_service_file: false,
             committed_records: 0,
             accepted: false,
-            records: vec![
-                InstallationRecord {
-                    destination: PathBuf::from("/usr/local/bin/auc"),
-                    staged: PathBuf::from(format!("/usr/local/bin/.capulus-auc-{job}/new/auc")),
-                    backup: PathBuf::from(format!("/usr/local/bin/.capulus-auc-{job}/old/auc")),
-                    original_digest: None,
-                    new_digest: Some("00".repeat(32)),
-                },
-                InstallationRecord {
-                    destination: PathBuf::from("/etc/systemd/system/auc-agent.service"),
-                    staged: PathBuf::from(format!(
-                        "/etc/systemd/system/.capulus-auc-{job}/new/auc-agent.service"
-                    )),
-                    backup: PathBuf::from(format!(
-                        "/etc/systemd/system/.capulus-auc-{job}/old/auc-agent.service"
-                    )),
-                    original_digest: None,
-                    new_digest: Some("11".repeat(32)),
-                },
-                InstallationRecord {
-                    destination: PathBuf::from("/etc/systemd/system/auc-agent.socket"),
-                    staged: PathBuf::from(format!(
-                        "/etc/systemd/system/.capulus-auc-{job}/new/auc-agent.socket"
-                    )),
-                    backup: PathBuf::from(format!(
-                        "/etc/systemd/system/.capulus-auc-{job}/old/auc-agent.socket"
-                    )),
-                    original_digest: None,
-                    new_digest: Some("22".repeat(32)),
-                },
-                InstallationRecord {
-                    destination: PathBuf::from("/etc/systemd/system/auc-capulus.socket"),
-                    staged: PathBuf::from(format!(
-                        "/etc/systemd/system/.capulus-auc-{job}/new/auc-capulus.socket"
-                    )),
-                    backup: PathBuf::from(format!(
-                        "/etc/systemd/system/.capulus-auc-{job}/old/auc-capulus.socket"
-                    )),
-                    original_digest: None,
-                    new_digest: Some("33".repeat(32)),
-                },
-            ],
+            records: destinations
+                .into_iter()
+                .map(|destination| {
+                    let root = destination
+                        .parent()
+                        .unwrap()
+                        .join(format!(".capulus-auc-{job}"));
+                    let name = destination.file_name().unwrap();
+                    InstallationRecord {
+                        staged: root.join("new").join(name),
+                        backup: root.join("old").join(name),
+                        destination,
+                        original_digest: None,
+                        new_digest: Some("00".repeat(32)),
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1380,6 +1361,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn journal_rejects_a_partial_previous_unit_topology() {
         let mut journal = first_install_journal();
         journal.previous_service_file = true;
@@ -1390,13 +1372,10 @@ mod tests {
 
     #[test]
     fn unit_verification_uses_committed_destination() {
-        assert_eq!(
-            committed_unit_paths(&first_install_journal()),
-            [
-                Path::new("/etc/systemd/system/auc-agent.service"),
-                Path::new("/etc/systemd/system/auc-agent.socket"),
-                Path::new("/etc/systemd/system/auc-capulus.socket"),
-            ]
-        );
+        let expected = super::super::layout::installation_units("auc")
+            .iter()
+            .map(|unit| Path::new(super::super::layout::UNIT_DIRECTORY).join(unit))
+            .collect::<Vec<_>>();
+        assert_eq!(committed_unit_paths(&first_install_journal()), expected);
     }
 }

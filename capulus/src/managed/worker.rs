@@ -30,6 +30,12 @@ impl RedeployWorker {
     where
         F: Fn() -> Result<AgentInfo>,
     {
+        #[cfg(target_os = "macos")]
+        let _deadline = WorkerDeadline::start(
+            self.coordinator.clone(),
+            job,
+            self.product.redeploy_runtime_max(),
+        )?;
         match self.execute(job, application_health).await {
             Ok(()) => {
                 self.coordinator.complete(job)?;
@@ -243,4 +249,53 @@ fn validate_health(
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct WorkerDeadline {
+    cancel: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl WorkerDeadline {
+    fn start(coordinator: RedeployCoordinator, job: JobId, timeout: Duration) -> Result<Self> {
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("capulus-worker-deadline".into())
+            .spawn(move || {
+                if receiver.recv_timeout(timeout) != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    return;
+                }
+                let detail = "worker runtime expired; installation journal retained for recovery";
+                eprintln!("capulus: {detail}");
+                match coordinator.status(job).and_then(|status| {
+                    coordinator.fail_worker(job, detail, status.system_committed, None)
+                }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        eprintln!("capulus could not record the expired deadline: {error:#}")
+                    }
+                }
+                // launchd terminates the worker's remaining process group when its leader exits.
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGKILL);
+                }
+            })?;
+        Ok(Self {
+            cancel: Some(cancel),
+            thread: Some(thread),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for WorkerDeadline {
+    fn drop(&mut self) {
+        self.cancel.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }

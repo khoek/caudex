@@ -7,7 +7,7 @@ capulus provides reusable building blocks for polished, robust CLIs:
 - terminal-aware tasks, counters, countdowns, live groups, prompts, and typed cancellation;
 - invocation locks, checked child-process helpers, secure temporary files, and atomic stores;
 - container, artifact, path, shell, and Google Cloud helpers; and
-- optional Linux support for a product CLI that also contains its privileged system agent.
+- optional Linux and macOS support for a product CLI that also contains its privileged system agent.
 
 The default feature set contains the general CLI utilities. `managed-client` adds the bounded
 management protocol, Unix-socket client, and unprivileged exact-version Cargo updater.

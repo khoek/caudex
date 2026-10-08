@@ -8,15 +8,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use super::account::ensure_root_directory;
-use super::systemd::SystemdError;
+use super::service::ServiceError;
 use super::{
     JobId, JobPhase, ManagedProduct, PeerCredentials, RedeployJob, RedeployOutcome,
-    ResolvedRelease, SystemdManager, UnixAccount,
+    ResolvedRelease, ServiceManager, UnixAccount,
 };
 
-const STATE_ROOT: &str = "/var/lib/capulus/jobs";
-const RUNTIME_ROOT: &str = "/run/capulus/jobs";
-const LOCK_ROOT: &str = "/run/capulus/locks";
+const STATE_ROOT: &str = super::layout::JOB_STATE;
+const RUNTIME_ROOT: &str = super::layout::JOB_RUNTIME;
+const LOCK_ROOT: &str = super::layout::LOCK_DIRECTORY;
 const TRANSIENT_START_GRACE: Duration = Duration::from_secs(5);
 const ACTIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -55,7 +55,7 @@ impl RedeployRequest {
 pub struct RedeployCoordinator {
     product: Arc<ManagedProduct>,
     store: JobStore,
-    systemd: SystemdManager,
+    services: ServiceManager,
     startup_reconciliation: StartupReconciliation,
 }
 
@@ -79,12 +79,13 @@ impl RedeployCoordinator {
         Ok(Self {
             store,
             product,
-            systemd: SystemdManager,
+            services: ServiceManager,
             startup_reconciliation,
         })
     }
 
     pub(super) fn start_startup_reconciler(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
         if self.startup_reconciliation == StartupReconciliation::None {
             return Ok(());
         }
@@ -106,11 +107,35 @@ impl RedeployCoordinator {
             .build()
             .context("failed to create the Capulus startup-reconciliation runtime")?
             .block_on(async {
+                #[cfg(target_os = "macos")]
+                self.reap_finished_workers().await?;
                 match self.startup_reconciliation {
                     StartupReconciliation::None => Ok(()),
                     StartupReconciliation::Monitor(job) => self.monitor_active_job_async(job).await,
                 }
             })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn reap_finished_workers(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.store.runtime_directory)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let prefix = format!("{}-redeploy-", self.product.name());
+            let Some(job) = name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".plist"))
+            else {
+                continue;
+            };
+            let job = JobId::parse(job)?;
+            if self.store.status(job)?.phase.is_terminal() {
+                self.services.finish_redeploy(&self.product, job).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn authorize_redeploy(
@@ -173,7 +198,7 @@ impl RedeployCoordinator {
             self.store.clear_active(active.job)?;
         }
         let job = JobId::random();
-        let unit = SystemdManager::redeploy_unit_name(&self.product, job);
+        let unit = ServiceManager::redeploy_unit_name(&self.product, job);
         let request = RedeployRequest {
             job,
             product: self.product.name().to_string(),
@@ -183,7 +208,7 @@ impl RedeployCoordinator {
         request.validate(&self.product)?;
         self.store.write_request(&request)?;
         self.store.initialize(&request, unit.clone())?;
-        if let Err(error) = self.systemd.start_redeploy(&self.product, job).await {
+        if let Err(error) = self.services.start_redeploy(&self.product, job).await {
             self.store.fail(
                 job,
                 format!("failed to start transient unit: {error}"),
@@ -215,13 +240,13 @@ impl RedeployCoordinator {
         loop {
             match monitored_job_state(self.store.active()?.as_ref(), job) {
                 MonitoredJobState::Active => {}
-                MonitoredJobState::Inactive => return Ok(()),
-                MonitoredJobState::Superseded => return Ok(()),
+                MonitoredJobState::Inactive => break,
+                MonitoredJobState::Superseded => break,
             }
             match self.reconcile_active().await {
                 Ok(()) => {}
-                Err(error) if error.downcast_ref::<SystemdError>().is_some() => {
-                    eprintln!("capulus systemd reconciliation failed; retrying: {error:#}");
+                Err(error) if error.downcast_ref::<ServiceError>().is_some() => {
+                    eprintln!("capulus services reconciliation failed; retrying: {error:#}");
                 }
                 Err(error) => return Err(error),
             }
@@ -229,10 +254,13 @@ impl RedeployCoordinator {
                 MonitoredJobState::Active => {
                     tokio::time::sleep(ACTIVE_RECONCILIATION_INTERVAL).await;
                 }
-                MonitoredJobState::Inactive => return Ok(()),
-                MonitoredJobState::Superseded => return Ok(()),
+                MonitoredJobState::Inactive => break,
+                MonitoredJobState::Superseded => break,
             }
         }
+        #[cfg(target_os = "macos")]
+        self.services.finish_redeploy(&self.product, job).await?;
+        Ok(())
     }
 
     pub fn status(&self, job: JobId) -> Result<RedeployJob> {
@@ -311,7 +339,7 @@ impl RedeployCoordinator {
             return Ok(());
         }
         if self
-            .systemd
+            .services
             .redeploy_is_active(&self.product, active.job)
             .await?
             || (status.phase == JobPhase::Queued
@@ -413,9 +441,10 @@ impl JobStore {
             state_directory: Path::new(STATE_ROOT).join(product),
             runtime_directory: Path::new(RUNTIME_ROOT).join(product),
         };
-        ensure_root_directory(Path::new("/var/lib/capulus"), 0o700)?;
+        super::account::prepare_state_parent()?;
+        ensure_root_directory(Path::new(super::layout::STATE_DIRECTORY), 0o700)?;
         ensure_root_directory(Path::new(STATE_ROOT), 0o700)?;
-        ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
+        ensure_root_directory(Path::new(super::layout::CAPULUS_RUNTIME), 0o711)?;
         ensure_root_directory(Path::new(RUNTIME_ROOT), 0o700)?;
         ensure_root_directory(Path::new(LOCK_ROOT), 0o700)?;
         ensure_root_directory(&store.state_directory, 0o700)?;
@@ -433,7 +462,7 @@ impl JobStore {
                 version: request.release.version.to_string(),
                 unit,
                 phase: JobPhase::Queued,
-                detail: "queued for transient systemd execution".to_string(),
+                detail: "queued for managed worker execution".to_string(),
                 system_committed: false,
                 rollback_succeeded: None,
             },
@@ -681,9 +710,23 @@ fn remove_file(path: &Path) -> Result<()> {
     }
 }
 
-fn boot_id() -> Result<String> {
+pub fn boot_id() -> Result<String> {
+    #[cfg(target_os = "linux")]
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .context("failed to read kernel boot ID")?;
+    #[cfg(target_os = "macos")]
+    let value = {
+        let output = crate::process::CaptureOptions::default().validate()?.run(
+            std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]),
+            None,
+        )?;
+        anyhow::ensure!(
+            output.status.success(),
+            "failed to read kernel boot ID: {}",
+            output.stderr.trim()
+        );
+        output.stdout
+    };
     let value = value.trim();
     if value.len() != 36
         || !value

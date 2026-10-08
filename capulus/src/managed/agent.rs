@@ -24,6 +24,8 @@ pub struct ManagedAgent<S> {
 
 impl<S> ManagedAgent<S> {
     pub fn new(product: Arc<ManagedProduct>, releases: Arc<S>) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        product.configure_native_runtime()?;
         let coordinator = RedeployCoordinator::new(Arc::clone(&product))?;
         coordinator.start_startup_reconciler()?;
         Ok(Self {

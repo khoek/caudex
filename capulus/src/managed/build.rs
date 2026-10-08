@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use super::account::{ensure_owned_directory, ensure_root_directory, require_root};
 use super::{BuildAccount, InstallationManifest, ManagedProduct, RedeployRequest, UnixAccount};
 
-const GLOBAL_BUILD_LOCK_ROOT: &str = "/run/capulus/locks";
+const GLOBAL_BUILD_LOCK_ROOT: &str = super::layout::LOCK_DIRECTORY;
 const GLOBAL_BUILD_LOCK_NAME: &str = "managed-build";
 const RUSTUP_DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 const TOOLCHAIN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -326,7 +326,7 @@ fn clear_build_output(mut command: Command, target: &Path) -> Result<()> {
 }
 
 pub(super) fn acquire_managed_build_lock() -> Result<crate::InvocationLock> {
-    ensure_root_directory(Path::new("/run/capulus"), 0o711)?;
+    ensure_root_directory(Path::new(super::layout::CAPULUS_RUNTIME), 0o711)?;
     ensure_root_directory(Path::new(GLOBAL_BUILD_LOCK_ROOT), 0o700)?;
     crate::acquire_named_in(GLOBAL_BUILD_LOCK_ROOT, GLOBAL_BUILD_LOCK_NAME, true)
         .context("failed to acquire global Capulus build lock")
@@ -351,7 +351,7 @@ impl BuildArtifacts {
     pub fn from_installed_program(product: &ManagedProduct) -> Result<Self> {
         require_root()?;
         let installed = product.program().trusted_installed_path()?;
-        let running = fs::canonicalize("/proc/self/exe")
+        let running = fs::canonicalize(std::env::current_exe()?)
             .context("failed to resolve the running managed program")?;
         if running != fs::canonicalize(installed)? {
             bail!(
@@ -417,6 +417,8 @@ impl ArtifactOwner {
 
 fn rustup_target() -> Result<&'static str> {
     match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "macos") => Ok("x86_64-apple-darwin"),
+        ("aarch64", "macos") => Ok("aarch64-apple-darwin"),
         ("x86_64", "linux") => Ok("x86_64-unknown-linux-gnu"),
         ("aarch64", "linux") => Ok("aarch64-unknown-linux-gnu"),
         (architecture, operating_system) => bail!(
@@ -526,9 +528,17 @@ mod tests {
     use crate::managed::CargoRegistry;
 
     #[test]
-    fn rustup_target_is_explicit_for_supported_linux_architectures() {
+    fn rustup_target_is_explicit_for_supported_native_architectures() {
         if matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
-            assert!(rustup_target().unwrap().ends_with("-unknown-linux-gnu"));
+            assert!(
+                rustup_target()
+                    .unwrap()
+                    .ends_with(if cfg!(target_os = "macos") {
+                        "-apple-darwin"
+                    } else {
+                        "-unknown-linux-gnu"
+                    })
+            );
         }
     }
 
