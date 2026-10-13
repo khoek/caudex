@@ -802,6 +802,16 @@ fn open_or_create_restricted_directory_with(
     }
     let directory = open_directory_at(&parent, name)
         .with_context(|| format!("failed to open {}", path.display()))?;
+    if created {
+        // BSD filesystems inherit the parent's group even without its setgid bit.
+        // Only normalize a directory created by this invocation; an existing
+        // directory must pass the ownership checks without being taken over.
+        set_directory_owner_and_sync(
+            &directory,
+            boundary_owner,
+            &format!("failed to normalize ownership of {}", path.display()),
+        )?;
+    }
     if !created
         && DirectoryIdentity::from_metadata(&directory.metadata()?)
             .is_restricted_creation(boundary_owner)
@@ -1365,6 +1375,118 @@ mod tests {
     }
 
     #[test]
+    fn newly_created_directory_normalizes_inherited_group() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("requires root to exercise inherited gid 1");
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("parent");
+        create_test_directory(&parent, 0o700);
+        set_test_owner(&parent, DirectoryOwner { uid: 0, gid: 1 });
+        // Linux needs setgid to emulate BSD group inheritance.
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o2700)).unwrap();
+        let path = parent.join("capulus");
+        let (directory, initializing) = open_or_create_restricted_directory_with(
+            &path,
+            DirectoryOwner::ROOT,
+            || {
+                assert_eq!(fs::symlink_metadata(&path)?.gid(), 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(initializing);
+        assert!(
+            DirectoryIdentity::from_metadata(&directory.metadata().unwrap())
+                .is_owned_directory(DirectoryOwner::ROOT, 0o700)
+        );
+        let inode = directory.metadata().unwrap().ino();
+        ensure_root_directory(&path, 0o755).unwrap();
+        assert_owned_mode(&path, DirectoryOwner::ROOT, 0o755);
+        assert_eq!(fs::symlink_metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::symlink_metadata(&parent).unwrap().gid(), 1);
+    }
+
+    #[test]
+    fn interrupted_inherited_group_creation_is_not_taken_over_on_retry() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("requires root to exercise inherited gid 1");
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("interrupted");
+        assert!(open_or_create_restricted_directory_with(
+            &path,
+            DirectoryOwner::ROOT,
+            || {
+                set_test_owner(&path, DirectoryOwner { uid: 0, gid: 1 });
+                bail!("injected failure before ownership normalization")
+            },
+        )
+        .is_err());
+        let before = fs::symlink_metadata(&path).unwrap();
+        assert!(ensure_root_directory(&path, 0o755).is_err());
+        let after = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode(), after.ino()),
+            (before.uid(), before.gid(), before.mode(), before.ino())
+        );
+    }
+
+    #[test]
+    fn existing_root_directory_ownership_and_contents_are_preserved() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("requires root to exercise foreign ownership");
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        for (name, owner) in [
+            ("wrong-group", DirectoryOwner { uid: 0, gid: 1 }),
+            ("wrong-user", DirectoryOwner { uid: 1, gid: 0 }),
+            ("trusted", DirectoryOwner::ROOT),
+        ] {
+            let path = temporary.path().join(name);
+            create_test_directory(&path, 0o700);
+            fs::write(path.join("retained"), b"data").unwrap();
+            set_test_owner(&path, owner);
+            let before = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                ensure_root_directory(&path, 0o700).is_ok(),
+                owner == DirectoryOwner::ROOT
+            );
+            let after = fs::symlink_metadata(&path).unwrap();
+            assert_eq!(
+                (after.uid(), after.gid(), after.mode(), after.ino()),
+                (before.uid(), before.gid(), before.mode(), before.ino())
+            );
+            assert_eq!(fs::read(path.join("retained")).unwrap(), b"data");
+        }
+    }
+
+    #[test]
+    fn existing_symlink_is_rejected_without_changing_its_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        create_test_directory(&target, 0o700);
+        let path = temporary.path().join("link");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let before = fs::symlink_metadata(&target).unwrap();
+        let owner = DirectoryOwner {
+            uid: before.uid(),
+            gid: before.gid(),
+        };
+        assert!(open_or_create_restricted_directory(&path, owner).is_err());
+        let after = fs::symlink_metadata(&target).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode(), after.ino()),
+            (before.uid(), before.gid(), before.mode(), before.ino())
+        );
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
     fn invalid_layouts_are_rejected_before_the_final_boundary_transition() {
         let temporary = tempfile::tempdir().unwrap();
         let build = test_build(temporary.path().join("invalid-home-mode"));
@@ -1536,3 +1658,4 @@ mod tests {
             .collect()
     }
 }
+
