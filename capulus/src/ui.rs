@@ -188,11 +188,38 @@ pub fn clear_progress_bar(progress: &MultiProgress, progress_bar: &ProgressBar) 
 }
 
 pub fn maybe_open_browser(url: &str) {
-    if let Err(err) = webbrowser::open(url) {
+    if let Err(err) = open_browser(url) {
         warn(&format!(
             "Could not open a browser automatically: {err}. Open this URL manually: {url}"
         ));
     }
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("/usr/bin/open");
+        command.arg("--").arg(url);
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"DYLD_") {
+                command.env_remove(name);
+            }
+        }
+        let output = crate::process::CaptureOptions {
+            timeout: Duration::from_secs(10),
+            ..Default::default()
+        }
+        .validate()?
+        .run(&mut command, None)?;
+        anyhow::ensure!(
+            output.status.success(),
+            "open browser: {}",
+            output.stderr.trim()
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    webbrowser::open(url)?;
+    Ok(())
 }
 
 pub fn print_big_red_error(message: &str) {

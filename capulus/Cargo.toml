@@ -1,6 +1,6 @@
 [package]
 name = "capulus"
-version = "0.6.14"
+version = "0.6.15"
 edition.workspace = true
 license.workspace = true
 description = "Shared support for Rust command-line tools."
@@ -43,6 +43,8 @@ thiserror = "2"
 time = { version = "0.3", features = ["parsing"] }
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "sync", "time"], optional = true }
 toml = "1"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 webbrowser = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
